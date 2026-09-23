@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Bounce Arena</title>
+    <link rel="icon" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body data-mode="menu">
+    <canvas id="view" aria-label="Bounce Arena"></canvas>
+    <div id="scrim"></div>
+    <div id="ui"></div>
+    <div id="hud" hidden></div>
+    <div id="touch" hidden>
+      <div id="stick" class="stick" aria-label="Steer"><div id="knob" class="knob"></div></div>
+      <button id="btn-brake" type="button">BRAKE</button>
+      <div class="touch-actions">
+        <button id="btn-ability" type="button">ABILITY</button>
+        <button id="btn-dash" type="button">DASH</button>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
