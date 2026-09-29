@@ -88,6 +88,14 @@ export class AudioBus {
     this.tone(164, 0.22, 'sine', 0.04)
   }
 
+  /** Deep boom and a falling whoosh under the slow-motion finish. */
+  finish(): void {
+    if (!this.started) return
+    this.noise(0.6, 0.22, 160)
+    this.tone(48, 0.7, 'sine', 0.16)
+    this.sweep(900, 90, 0.9, 0.05)
+  }
+
   click(): void {
     this.tone(680, 0.04, 'square', 0.03)
   }

@@ -68,8 +68,8 @@ export class Input {
     }
     if (mouseSteer && this.pointer.inside && x === 0 && y === 0) {
       const s = screenOf(worldX, worldY)
-      const dx = this.pointer.x - s.x / window.devicePixelRatio
-      const dy = this.pointer.y - s.y / window.devicePixelRatio
+      const dx = this.pointer.x - s.x
+      const dy = this.pointer.y - s.y
       const m = Math.hypot(dx, dy)
       if (m > 24) {
         x = dx / m

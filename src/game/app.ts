@@ -34,6 +34,9 @@ class App {
   last = 0
   blip = -1
   youId = 'you'
+  lastElim: { x: number; y: number; color: string; time: number } | null = null
+  finaleShown = false
+  wiping = false
 
   constructor() {
     this.profile = loadProfile()
@@ -62,7 +65,8 @@ class App {
       requestAnimationFrame(this.frame)
       return
     }
-    this.acc += dt
+    const live = this.highlight || (this.session && this.screen === 'match' && !this.paused)
+    this.acc += dt * (live ? this.renderer.timeScale(dt) : 1)
     let steps = 0
     while (this.acc >= DT && steps < 5) {
       this.tick()
@@ -77,6 +81,7 @@ class App {
   private tick(): void {
     if (this.highlight) {
       this.highlight.step()
+      this.readFx(this.highlight)
       this.highlightLeft -= DT
       if (this.highlightLeft <= 0 || this.highlight.status === 'finished') {
         this.highlight = null
@@ -98,6 +103,7 @@ class App {
       }
       this.session.step()
       this.readFx(match)
+      this.watchFinale(match)
       this.watchCountdown(match)
       if (match.status === 'finished' && !this.settled) this.finishMatch()
       if (match.config.modeId === 'tutorial') {
@@ -118,12 +124,7 @@ class App {
   }
 
   private draw(): void {
-    const prefs = {
-      shake: this.profile.settings.shake,
-      fx: this.profile.settings.fx,
-      colorblind: this.profile.settings.colorblind,
-      reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
-    }
+    const prefs = this.prefs()
     const menu = this.screen !== 'match' && this.screen !== 'results'
     const bias = menu ? Math.min(220, window.innerWidth * 0.18) : 0
     if (this.highlight) {
@@ -136,6 +137,7 @@ class App {
       if (this.screen === 'match') {
         this.shell.syncHud(match, this.youId, this.hint(match))
         const you = match.players.find((p) => p.id === this.youId)
+        document.body.dataset.out = you && !you.alive && you.eliminated ? 'yes' : ''
         if (you && this.profile.settings.haptics && you.hitFlash > 0.85 && navigator.vibrate) navigator.vibrate(10)
       }
       return
@@ -144,6 +146,10 @@ class App {
   }
 
   private play(options: PlayOptions): void {
+    this.transition(() => this.begin(options))
+  }
+
+  private begin(options: PlayOptions): void {
     this.audio.resume()
     const earlyClassic = this.profile.matches < 2 && options.modeId === 'ffa' && options.arenaId === 'random'
     const tuned = earlyClassic ? { ...options, arenaId: 'classic' } : options
@@ -153,6 +159,9 @@ class App {
     this.paused = false
     this.highlight = null
     this.youId = 'you'
+    this.lastElim = null
+    this.finaleShown = false
+    this.renderer.reset()
     this.input.reset()
     const config = buildMatchConfig(this.profile, tuned)
     this.session = new Session(config)
@@ -177,8 +186,10 @@ class App {
     this.profile.tutorialDone = true
     saveProfile(this.profile)
     const you = result.placements.find((p) => p.id === this.youId)
-    if (you?.place === 1) this.audio.win()
-    else this.audio.lose()
+    if (you?.place === 1) {
+      this.audio.win()
+      this.renderer.confetti([you.color, '#ffc14d', '#ff4d3a', '#7ee0ff', '#f4f7fb'])
+    } else this.audio.lose()
     this.show('results')
   }
 
@@ -191,13 +202,16 @@ class App {
       this.finishMatch()
       return
     }
-    this.session = null
-    this.show('menu')
+    this.transition(() => {
+      this.session = null
+      this.show('menu')
+    })
   }
 
   private show(screen: 'menu' | 'play' | 'loadout' | 'career' | 'collection' | 'settings' | 'results'): void {
     this.screen = screen
     document.body.dataset.mode = screen === 'results' ? 'results' : 'menu'
+    document.body.dataset.out = ''
     hudRoot.hidden = true
     this.paused = false
     if (screen === 'menu') this.shell.showMenu(this.profile)
@@ -266,16 +280,55 @@ class App {
 
   private readFx(match: Match): void {
     const events = match.consumeFx()
-    this.renderer.absorb(events, {
-      shake: this.profile.settings.shake,
-      fx: this.profile.settings.fx,
-      colorblind: this.profile.settings.colorblind,
-      reducedMotion: false,
-    }, this.youId)
+    this.renderer.absorb(events, this.prefs(), this.youId, match)
     for (const e of events) {
       const local = e.actorId === this.youId || e.victimId === this.youId
       this.audio.fx(e, local)
+      if (e.type === 'elim') {
+        const victim = match.players.find((p) => p.id === e.victimId)
+        this.lastElim = { x: e.x, y: e.y, color: victim?.color ?? e.color, time: match.time }
+      }
     }
+  }
+
+  /** The knockout that decides the match gets the slow-motion finish. */
+  private watchFinale(match: Match): void {
+    if (this.finaleShown || match.status !== 'celebrate') return
+    this.finaleShown = true
+    const ko = this.lastElim
+    if (ko && match.time - ko.time < 0.5) {
+      this.renderer.finale(ko.x, ko.y, ko.color, this.prefs())
+      this.audio.finish()
+    }
+  }
+
+  private prefs() {
+    return {
+      shake: this.profile.settings.shake,
+      fx: this.profile.settings.fx,
+      colorblind: this.profile.settings.colorblind,
+      reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+      numbers: this.profile.settings.numbers,
+    }
+  }
+
+  /** Iris wipe between menu and match. Runs the swap while the screen is covered. */
+  private transition(run: () => void): void {
+    const wipe = document.querySelector('#wipe') as HTMLElement | null
+    if (!wipe || this.wiping || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      if (!this.wiping) run()
+      return
+    }
+    this.wiping = true
+    wipe.className = 'in'
+    window.setTimeout(() => {
+      run()
+      wipe.className = 'out'
+      window.setTimeout(() => {
+        wipe.className = ''
+        this.wiping = false
+      }, 420)
+    }, 300)
   }
 
   private watchCountdown(match: Match): void {
