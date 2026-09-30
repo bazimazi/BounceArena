@@ -20,6 +20,13 @@ export interface CareerStats {
   hazardElims: number
   dashElims: number
   comebacks: number
+  perfectDashes: number
+  wallKicks: number
+  escapes: number
+  abilityHits: number
+  podiums: number
+  rankedMatches: number
+  rankedWins: number
   bestStreak: number
   winStreak: number
   currentStreak: number
@@ -48,6 +55,26 @@ export interface RecentMatch {
   at: number
 }
 
+export interface SeasonRecord {
+  seasonId: string
+  name: string
+  peak: number
+  peakLabel: string
+  matches: number
+  wins: number
+  coins: number
+}
+
+export interface Daily {
+  /** dateKey of the last day with a finished match. */
+  lastDay: string
+  /** Consecutive days with at least one finished match. */
+  streak: number
+  bestStreak: number
+  /** dateKey the first-win bonus was last paid. */
+  firstWinDay: string
+}
+
 export interface Profile {
   version: number
   name: string
@@ -66,7 +93,12 @@ export interface Profile {
     skin: string
   }
   owned: string[]
+  /** Core mastery xp. */
   mastery: Record<string, number>
+  abilityMastery: Record<string, number>
+  /** Achievement id to tiers claimed. */
+  achievements: Record<string, number>
+  daily: Daily
   stats: CareerStats
   records: Records
   rank: {
@@ -77,6 +109,13 @@ export interface Profile {
     seasonId: string
     lastDelta: number
     lastReason: string
+    /** Ranked matches left where a loss cannot drop you out of a new tier. */
+    shield: number
+    /** Consecutive ranked wins. */
+    streak: number
+    seasonMatches: number
+    seasonWins: number
+    history: SeasonRecord[]
   }
   challenges: {
     dailyKey: string
@@ -85,10 +124,16 @@ export interface Profile {
     weekly: string[]
     progress: Record<string, number>
     done: string[]
+    /** Period keys whose sweep bonus is paid, like `d:2026-09-30`. */
+    sweeps: string[]
+    /** dateKey of the last reroll. One per day. */
+    rerollDay: string
   }
   seasonXp: number
   seasonId: string
   seasonClaimed: number
+  /** Overtime payouts claimed past the last season tier. */
+  seasonOvertime: number
   settled: string[]
   recent: RecentMatch[]
   settings: Settings
@@ -104,10 +149,12 @@ export interface Store {
 }
 
 export const PROFILE_KEY = 'bounce-arena-profile-v1'
+export const PROFILE_VERSION = 2
+export const MAX_LEVEL = 80
 
 export function defaultProfile(): Profile {
   return {
-    version: 1,
+    version: PROFILE_VERSION,
     name: 'Player',
     color: 0,
     accountXp: 0,
@@ -133,6 +180,9 @@ export function defaultProfile(): Profile {
       'skin_classic',
     ],
     mastery: {},
+    abilityMastery: {},
+    achievements: {},
+    daily: { lastDay: '', streak: 0, bestStreak: 0, firstWinDay: '' },
     stats: {
       matches: 0,
       wins: 0,
@@ -143,6 +193,13 @@ export function defaultProfile(): Profile {
       hazardElims: 0,
       dashElims: 0,
       comebacks: 0,
+      perfectDashes: 0,
+      wallKicks: 0,
+      escapes: 0,
+      abilityHits: 0,
+      podiums: 0,
+      rankedMatches: 0,
+      rankedWins: 0,
       bestStreak: 0,
       winStreak: 0,
       currentStreak: 0,
@@ -167,6 +224,11 @@ export function defaultProfile(): Profile {
       seasonId: 's1',
       lastDelta: 0,
       lastReason: '',
+      shield: 0,
+      streak: 0,
+      seasonMatches: 0,
+      seasonWins: 0,
+      history: [],
     },
     challenges: {
       dailyKey: '',
@@ -175,10 +237,13 @@ export function defaultProfile(): Profile {
       weekly: [],
       progress: {},
       done: [],
+      sweeps: [],
+      rerollDay: '',
     },
     seasonXp: 0,
     seasonId: 's1',
     seasonClaimed: 0,
+    seasonOvertime: 0,
     settled: [],
     recent: [],
     settings: {
@@ -203,11 +268,41 @@ export function loadProfile(store: Store = browserStore()): Profile {
   const raw = store.get(PROFILE_KEY)
   if (!raw) return defaultProfile()
   try {
-    const parsed = JSON.parse(raw) as Partial<Profile>
-    return { ...defaultProfile(), ...parsed, settings: { ...defaultProfile().settings, ...parsed.settings }, loadout: { ...defaultProfile().loadout, ...parsed.loadout }, equipped: { ...defaultProfile().equipped, ...parsed.equipped }, rank: { ...defaultProfile().rank, ...parsed.rank }, stats: { ...defaultProfile().stats, ...parsed.stats }, records: { ...defaultProfile().records, ...parsed.records }, challenges: { ...defaultProfile().challenges, ...parsed.challenges } }
+    return migrateProfile(JSON.parse(raw) as Partial<Profile>)
   } catch {
     return defaultProfile()
   }
+}
+
+/** Fills fields added since the save was written. Older saves keep everything they had. */
+export function migrateProfile(parsed: Partial<Profile>): Profile {
+  const base = defaultProfile()
+  const profile: Profile = {
+    ...base,
+    ...parsed,
+    settings: { ...base.settings, ...parsed.settings },
+    loadout: { ...base.loadout, ...parsed.loadout },
+    equipped: { ...base.equipped, ...parsed.equipped },
+    rank: { ...base.rank, ...parsed.rank },
+    stats: { ...base.stats, ...parsed.stats },
+    records: { ...base.records, ...parsed.records },
+    challenges: { ...base.challenges, ...parsed.challenges },
+    daily: { ...base.daily, ...parsed.daily },
+    mastery: { ...parsed.mastery },
+    abilityMastery: { ...parsed.abilityMastery },
+    achievements: { ...parsed.achievements },
+  }
+  if ((parsed.version ?? 1) < 2) {
+    // v1 kept completed challenge ids forever, which froze any challenge that rotated back in.
+    const active = new Set([...profile.challenges.daily, ...profile.challenges.weekly])
+    profile.challenges.done = profile.challenges.done.filter((id) => active.has(id))
+    // v1 counted ability casts per ability; seed ability mastery from them.
+    for (const [id, uses] of Object.entries(profile.stats.abilityUses)) {
+      profile.abilityMastery[id] = Math.max(profile.abilityMastery[id] ?? 0, Math.min(900, uses * 6))
+    }
+  }
+  profile.version = PROFILE_VERSION
+  return profile
 }
 
 export function saveProfile(profile: Profile, store: Store = browserStore()): void {
@@ -246,7 +341,7 @@ export function memoryStore(seed?: string): Store {
 
 export function levelFromXp(xp: number): number {
   let level = 1
-  while (xpForLevel(level + 1) <= xp && level < 80) level += 1
+  while (xpForLevel(level + 1) <= xp && level < MAX_LEVEL) level += 1
   return level
 }
 
@@ -258,6 +353,7 @@ export function xpForLevel(level: number): number {
 export function xpIntoLevel(xp: number): { level: number; have: number; need: number } {
   const level = levelFromXp(xp)
   const start = xpForLevel(level)
+  if (level >= MAX_LEVEL) return { level, have: 1, need: 1 }
   const next = xpForLevel(level + 1)
   return { level, have: xp - start, need: Math.max(1, next - start) }
 }

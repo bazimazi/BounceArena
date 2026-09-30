@@ -28,6 +28,19 @@ Free-for-all is the default: three stocks, about 80 seconds, then sudden death i
 
 Ranked matches use a standard ball (stable core, rubber shell, no passive). The ability you picked is the only signature. Account level, mastery, and cosmetics do not change competitive hits.
 
+## Progression
+
+Everything earned is cosmetic or coins. Nothing changes a hit.
+
+- **Account level** (cap 80): coins every level, a bigger payout every fifth, cosmetics through level 30. Match xp is itemized on the results screen: placement, knockouts, time, day streak, first win of the day, win streak.
+- **Mastery**: ten levels for each core and each ability. Level-ups pay coins, cores unlock cosmetics, and every ability has a title at mastery 5. Forfeits earn none.
+- **Challenges**: three daily and three weekly, one reroll a day, and a sweep bonus for clearing a full set. Completing one also pays season xp.
+- **Season track**: 16 tiers per season, then repeatable overtime coins. When a season ends you get coins for your peak rank, plus a season title at Gold or higher, and the season goes into your history.
+- **Ranked**: five placement matches, a three-match shield after a promotion so one loss cannot drop you straight back, and a small bonus from the third ranked win in a row.
+- **Awards**: fifteen three-tier achievements built on career stats, each ending in a cosmetic.
+
+Rewards added after a player already passed them are paid when the profile loads and shown once on the menu. Saves from before these changes migrate on load (`migrateProfile`).
+
 ## Layout
 
 - `src/sim` authoritative match, physics, hazards, abilities, bots, replay input log

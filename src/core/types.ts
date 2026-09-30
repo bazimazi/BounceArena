@@ -126,6 +126,8 @@ export interface BodyStats {
   score: number
   zoneTime: number
   hits: number
+  /** Play time of the first credited knockout, 0 if none. */
+  firstElimAt: number
   behindAtMid: boolean
 }
 
@@ -224,6 +226,7 @@ export interface Placement {
   wallKicks: number
   stocksLeft: number
   longestLife: number
+  firstElimAt: number
   behindAtMid: boolean
   won: boolean
 }
@@ -254,6 +257,7 @@ export function emptyStats(): BodyStats {
     score: 0,
     zoneTime: 0,
     hits: 0,
+    firstElimAt: 0,
     behindAtMid: false,
   }
 }

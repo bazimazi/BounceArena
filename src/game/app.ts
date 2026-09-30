@@ -4,7 +4,7 @@ import { AudioBus } from '../audio/audio'
 import { attractConfig, buildMatchConfig, type PlayOptions } from '../game/setup'
 import { Input } from '../input/input'
 import { loadProfile, saveProfile, type Profile } from '../progression/profile'
-import { buyCosmetic, equipCosmetic, refreshChallenges, settle, type SettleOutcome } from '../progression/settle'
+import { buyCosmetic, equipCosmetic, refresh, rerollChallenge, settle, type Grant, type SettleOutcome } from '../progression/settle'
 import { Renderer } from '../render/render'
 import { Match } from '../sim/match'
 import { Session } from '../sim/session'
@@ -37,10 +37,12 @@ class App {
   lastElim: { x: number; y: number; color: string; time: number } | null = null
   finaleShown = false
   wiping = false
+  /** Rewards paid while loading the profile, shown once on the menu. */
+  notices: Grant[] = []
 
   constructor() {
     this.profile = loadProfile()
-    refreshChallenges(this.profile)
+    this.notices = refresh(this.profile)
     saveProfile(this.profile)
     this.attract = new Match(attractConfig(1))
     this.applySettings()
@@ -214,7 +216,10 @@ class App {
     document.body.dataset.out = ''
     hudRoot.hidden = true
     this.paused = false
-    if (screen === 'menu') this.shell.showMenu(this.profile)
+    if (screen === 'menu') {
+      this.shell.showMenu(this.profile, this.notices)
+      this.notices = []
+    }
     if (screen === 'play') this.shell.showPlay(this.profile)
     if (screen === 'loadout') this.shell.showLoadout(this.profile)
     if (screen === 'career') this.shell.showCareer(this.profile)
@@ -376,6 +381,14 @@ class App {
       this.profile = next
       saveProfile(this.profile)
       this.shell.showCollection(this.profile)
+    }
+    this.shell.onReroll = (id) => {
+      const next = rerollChallenge(this.profile, id)
+      if (!next) return
+      this.audio.click()
+      this.profile = next
+      saveProfile(this.profile)
+      this.shell.showCareer(this.profile)
     }
     this.shell.onSettings = (partial) => {
       this.profile.settings = { ...this.profile.settings, ...partial }

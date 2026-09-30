@@ -828,6 +828,7 @@ export class Match {
     const killer = credited ? this.players.find((p) => p.id === b.lastAttacker && p.id !== b.id) : undefined
     if (killer) {
       killer.stats.elims += 1
+      if (killer.stats.firstElimAt === 0) killer.stats.firstElimAt = Math.max(0.01, this.time)
       killer.stats.score += this.config.modeId === 'score' ? 130 : 100
       if (b.lastHitDash) killer.stats.dashElims += 1
       if (reason === 'hazard' || b.lastHitHazard) killer.stats.hazardElims += 1
@@ -1081,6 +1082,7 @@ function toPlacement(p: Body, winners: string[]): Placement {
     wallKicks: p.stats.wallKicks,
     stocksLeft: p.stocks,
     longestLife: p.stats.longestLife,
+    firstElimAt: p.stats.firstElimAt,
     behindAtMid: p.stats.behindAtMid,
     won: winners.includes(p.id),
   }

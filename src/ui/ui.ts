@@ -1,9 +1,29 @@
 import { ABILITIES, CORES, PASSIVES, SHELLS } from '../data/tuning'
-import { ARENAS, CHALLENGES, COSMETICS, MODES, SEASON, rankName, type ArenaDef, type CosmeticDef } from '../data/content'
+import {
+  ACHIEVEMENTS,
+  ARENAS,
+  COSMETICS,
+  MODES,
+  OVERTIME_XP,
+  RANK_TIERS,
+  SWEEP_BONUS,
+  arenaById,
+  cosmeticById,
+  dateKey,
+  displaySeason,
+  MASTERY_LEVELS,
+  masteryLevel,
+  masteryReward,
+  modeById,
+  rankName,
+  rankTierIndex,
+  type ArenaDef,
+  type CosmeticDef,
+} from '../data/content'
 import { abilityById } from '../data/tuning'
 import type { MatchResult } from '../core/types'
 import { xpIntoLevel, type Profile } from '../progression/profile'
-import type { SettleOutcome } from '../progression/settle'
+import { achievementProgress, canReroll, challengeDef, liveDayStreak, type Grant, type SettleOutcome } from '../progression/settle'
 import { solidPose } from '../sim/geometry'
 import type { FeedItem, Banner, Match } from '../sim/match'
 import type { PlayOptions } from '../game/setup'
@@ -17,6 +37,18 @@ export interface PlayDraft {
 }
 
 type Nav = 'menu' | 'play' | 'loadout' | 'career' | 'collection' | 'settings'
+
+type CareerTab = 'overview' | 'challenges' | 'season' | 'mastery' | 'awards'
+
+const MASTERY_MAX = MASTERY_LEVELS.length
+
+const CAREER_TABS: [CareerTab, string][] = [
+  ['overview', 'Overview'],
+  ['challenges', 'Challenges'],
+  ['season', 'Season'],
+  ['mastery', 'Mastery'],
+  ['awards', 'Awards'],
+]
 
 const MODE_TAG: Record<string, string> = {
   ffa: 'FFA',
@@ -49,6 +81,8 @@ const SLOT_NAME: Record<CosmeticDef['slot'], string> = {
   frame: 'Frames',
   skin: 'Skins',
 }
+
+const GRANT_ORDER: Grant['kind'][] = ['rank', 'cosmetic', 'achievement', 'season', 'level', 'mastery', 'challenge', 'record', 'coins']
 
 interface HudRefs {
   phase: HTMLElement
@@ -90,6 +124,8 @@ export class Shell {
   onResume: () => void = () => {}
   onForfeit: () => void = () => {}
   onEnd: () => void = () => {}
+  onReroll: (id: string) => void = () => {}
+  careerTab: CareerTab = 'overview'
 
   private refs: HudRefs | null = null
   private rosterKey = ''
@@ -112,10 +148,11 @@ export class Shell {
     })
   }
 
-  showMenu(profile: Profile): void {
+  showMenu(profile: Profile, notices: Grant[] = []): void {
     const panel = this.screen('menu')
     panel.append(this.brand())
     panel.append(this.profileCard(profile))
+    if (notices.length) panel.append(noticeCard(notices))
 
     const play = button('', 'play big', () => this.onPlay(this.draft))
     play.append(el('span', '', 'PLAY'), el('kbd', '', 'ENTER'))
@@ -231,8 +268,10 @@ export class Shell {
   showLoadout(profile: Profile): void {
     const panel = this.screen('loadout', 'wide')
     panel.append(this.header('Loadout', 'Sidegrades, not upgrades. Ranked locks the ball to Stable / Rubber and turns passives off. Your ability stays.'))
-    panel.append(this.pick('Ability', 'F', ABILITIES, profile.loadout.ability, (id) => this.onLoadout('ability', id)))
-    panel.append(this.pick('Ball core', '', CORES, profile.loadout.core, (id) => this.onLoadout('core', id)))
+    const abilityBadge = (id: string) => `M${masteryLevel(profile.abilityMastery[id] ?? 0).level}`
+    const coreBadge = (id: string) => `M${masteryLevel(profile.mastery[id] ?? 0).level}`
+    panel.append(this.pick('Ability', 'F', ABILITIES, profile.loadout.ability, (id) => this.onLoadout('ability', id), abilityBadge))
+    panel.append(this.pick('Ball core', '', CORES, profile.loadout.core, (id) => this.onLoadout('core', id), coreBadge))
     panel.append(this.pick('Shell', '', SHELLS, profile.loadout.shell, (id) => this.onLoadout('shell', id)))
     panel.append(this.pick('Passive', '', PASSIVES.filter((p) => p.id !== 'none'), profile.loadout.passive, (id) => this.onLoadout('passive', id)))
     this.stagger(panel)
@@ -247,64 +286,209 @@ export class Shell {
     const hero = el('div', 'hero')
     const badge = el('div', 'rank-badge', placing ? '?' : rank.split(' ')[0]!.slice(0, 1))
     const info = el('div', '')
-    info.append(el('b', 'rank-title', rank), el('small', '', `Peak ${profile.rank.peakLabel}. ${profile.rank.lastReason || 'Play ranked to move this.'}`))
+    const title = el('b', 'rank-title', rank)
+    if (profile.rank.shield > 0 && !placing) title.append(el('span', 'shield', `Shield ${profile.rank.shield}`))
+    info.append(title, el('small', '', `Season peak ${profile.rank.peakLabel}. ${profile.rank.lastReason || 'Play ranked to move this.'}`))
+    if (!placing) info.append(rankLadder(profile.rank.rating))
     info.append(bar(lvl.have / lvl.need, `Level ${lvl.level}`, `${lvl.have} / ${lvl.need} xp`))
     hero.append(badge, info)
     panel.append(hero)
 
-    const stats = el('div', 'stats')
-    for (const [k, v] of [
-      ['Matches', profile.stats.matches],
-      ['Wins', profile.stats.wins],
-      ['Knockouts', profile.stats.elims],
-      ['Best streak', profile.stats.bestStreak],
-    ] as const) {
-      const d = el('div', 'stat')
-      d.append(el('b', '', String(v)), el('span', '', k))
-      stats.append(d)
+    const tabs = el('div', 'tabs')
+    tabs.setAttribute('role', 'tablist')
+    for (const [id, label] of CAREER_TABS) {
+      const tab = button(label, `tab${this.careerTab === id ? ' on' : ''}`, () => {
+        this.careerTab = id
+        this.showCareer(profile)
+      })
+      tab.setAttribute('role', 'tab')
+      tab.setAttribute('aria-selected', String(this.careerTab === id))
+      if (id === 'challenges') {
+        const open = [...profile.challenges.daily, ...profile.challenges.weekly].filter((c) => !profile.challenges.done.includes(c)).length
+        if (open) tab.append(el('i', 'count', String(open)))
+      }
+      tabs.append(tab)
     }
-    panel.append(stats)
+    panel.append(tabs)
+
+    if (this.careerTab === 'overview') this.careerOverview(panel, profile)
+    else if (this.careerTab === 'challenges') this.careerChallenges(panel, profile)
+    else if (this.careerTab === 'season') this.careerSeason(panel, profile)
+    else if (this.careerTab === 'mastery') this.careerMastery(panel, profile)
+    else this.careerAwards(panel, profile)
+    this.stagger(panel)
+  }
+
+  private careerOverview(panel: HTMLElement, profile: Profile): void {
+    const s = profile.stats
+    panel.append(statGrid([
+      ['Matches', String(s.matches)],
+      ['Wins', String(s.wins)],
+      ['Knockouts', String(s.elims)],
+      ['Podiums', String(s.podiums)],
+      ['Ranked wins', String(s.rankedWins)],
+      ['Best streak', String(s.bestStreak)],
+      ['Day streak', String(liveDayStreak(profile))],
+      ['Play time', `${Math.round(s.playTime / 60)}m`],
+    ]))
 
     panel.append(el('div', 'section', 'Records'))
-    const records = el('div', 'stats')
-    for (const [k, v] of [
-      ['Longest launch', `${profile.records.biggestLaunch.toFixed(1)} m`],
-      ['Top speed', String(Math.round(profile.records.highestSpeed))],
-      ['Best multi-KO', String(profile.records.bestMulti)],
+    const r = profile.records
+    panel.append(statGrid([
+      ['Longest launch', `${r.biggestLaunch.toFixed(1)} m`],
+      ['Top speed', String(Math.round(r.highestSpeed))],
+      ['Best multi-KO', String(r.bestMulti)],
+      ['Fastest KO', r.fastestElim ? `${r.fastestElim.toFixed(1)}s` : '-'],
+      ['Longest life', `${Math.round(r.longestSurvival)}s`],
+      ['Most KOs', String(r.mostElims)],
+      ['Comebacks', String(r.comebacks)],
       ['Coins', String(profile.coins)],
+    ]))
+
+    if (profile.recent.length) {
+      panel.append(el('div', 'section', 'Recent'))
+      const list = el('div', 'board recent')
+      for (const m of profile.recent.slice(0, 8)) {
+        const row = el('div', `slot${m.place === 1 ? ' medal m1' : ''}`)
+        row.append(el('b', 'pos', String(m.place)), el('span', '', `${modeById(m.mode).name} · ${arenaById(m.arena).name}`))
+        const delta = el('small', m.competitive ? (m.delta >= 0 ? 'up' : 'down') : '', m.competitive ? `${m.delta >= 0 ? '+' : ''}${m.delta}` : 'Casual')
+        row.append(delta)
+        list.append(row)
+      }
+      panel.append(list)
+    }
+
+    if (profile.rank.history.length) {
+      panel.append(el('div', 'section', 'Past seasons'))
+      const list = el('div', 'stack')
+      for (const h of profile.rank.history) {
+        const row = el('div', 'challenge')
+        row.append(el('b', 'tag', h.seasonId.toUpperCase()))
+        const body = el('div', '')
+        body.append(el('strong', '', `${h.name} · Peak ${h.peakLabel}`), el('small', '', `${h.wins} wins in ${h.matches} ranked · ${h.coins} coins`))
+        row.append(body)
+        list.append(row)
+      }
+      panel.append(list)
+    }
+  }
+
+  private careerChallenges(panel: HTMLElement, profile: Profile): void {
+    const reroll = canReroll(profile)
+    panel.append(el('p', 'lede', reroll ? 'One reroll a day. Swap a challenge you do not want.' : 'Reroll used today.'))
+    for (const [cadence, ids, label] of [
+      ['daily', profile.challenges.daily, 'Daily'],
+      ['weekly', profile.challenges.weekly, 'Weekly'],
     ] as const) {
-      const d = el('div', 'stat')
-      d.append(el('b', '', v), el('span', '', k))
-      records.append(d)
+      const done = ids.filter((id) => profile.challenges.done.includes(id)).length
+      const head = el('div', 'section', `${label} · ${done}/${ids.length}`)
+      panel.append(head)
+      const list = el('div', 'stack')
+      for (const id of ids) {
+        const def = challengeDef(id)
+        if (!def) continue
+        const prog = Math.min(profile.challenges.progress[id] ?? 0, def.target)
+        const finished = profile.challenges.done.includes(id)
+        const row = el('div', `challenge${finished ? ' done' : ''}`)
+        row.append(el('b', 'tag', cadence === 'daily' ? 'DAY' : 'WEEK'))
+        const body = el('div', '')
+        body.append(bar(finished ? 1 : prog / def.target, def.name, finished ? 'Done' : `${prog}/${def.target}`), el('small', '', `${def.detail} · ${def.coins} coins · ${def.xp} season xp`))
+        row.append(body)
+        if (!finished && reroll) {
+          const swap = button('Swap', 'chip reroll', () => this.onReroll(id))
+          swap.ariaLabel = `Reroll ${def.name}`
+          row.append(swap)
+        }
+        list.append(row)
+      }
+      const bonus = SWEEP_BONUS[cadence]
+      const key = cadence === 'daily' ? `d:${profile.challenges.dailyKey}` : `w:${profile.challenges.weeklyKey}`
+      const swept = profile.challenges.sweeps.includes(key)
+      list.append(el('div', `sweep${swept ? ' got' : ''}`, swept ? `${label} sweep paid` : `Finish all ${ids.length} for +${bonus.coins} coins and +${bonus.xp} season xp`))
+      panel.append(list)
     }
-    panel.append(records)
+  }
 
-    panel.append(el('div', 'section', 'Challenges'))
-    const list = el('div', 'stack')
-    for (const id of [...profile.challenges.daily, ...profile.challenges.weekly]) {
-      const def = CHALLENGES.find((c) => c.id === id)
-      if (!def) continue
-      const prog = Math.min(profile.challenges.progress[id] ?? 0, def.target)
-      const done = profile.challenges.done.includes(id)
-      const row = el('div', `challenge${done ? ' done' : ''}`)
-      row.append(el('b', 'tag', def.cadence === 'daily' ? 'DAY' : 'WEEK'))
-      const body = el('div', '')
-      body.append(bar(done ? 1 : prog / def.target, def.name, done ? 'Done' : `${prog}/${def.target}`), el('small', '', `${def.detail} · ${def.coins} coins`))
-      row.append(body)
-      list.append(row)
+  private careerSeason(panel: HTMLElement, profile: Profile): void {
+    const season = displaySeason()
+    const live = season.id === profile.seasonId
+    const now = Date.now()
+    const start = Date.parse(season.start)
+    const end = Date.parse(season.end) + 86400000
+    const days = Math.max(0, Math.ceil(((now < start ? start : end) - now) / 86400000))
+    const when = now < start ? `Starts in ${days} day${days === 1 ? '' : 's'}` : `${days} day${days === 1 ? '' : 's'} left`
+    const head = el('div', 'season-head')
+    head.append(el('strong', '', season.name), el('small', '', when))
+    panel.append(head)
+
+    const xp = live ? profile.seasonXp : 0
+    const claimed = live ? profile.seasonClaimed : 0
+    const nextTier = season.tiers[claimed]
+    if (nextTier) {
+      const prev = season.tiers[claimed - 1]?.xp ?? 0
+      const span = Math.max(1, nextTier.xp - prev)
+      panel.append(bar((xp - prev) / span, `Tier ${claimed + 1} · ${tierReward(nextTier)}`, `${xp - prev} / ${span} xp`))
+    } else {
+      const last = season.tiers[season.tiers.length - 1]!.xp
+      const into = (xp - last) % OVERTIME_XP
+      panel.append(bar(into / OVERTIME_XP, 'Overtime · coins every tier', `${into} / ${OVERTIME_XP} xp`))
     }
-    panel.append(list)
-
-    panel.append(el('div', 'section', `Season · ${SEASON.name}`))
     const track = el('div', 'season')
-    SEASON.tiers.forEach((tier, i) => {
-      const pip = el('div', `tier${i < profile.seasonClaimed ? ' got' : ''}`)
+    season.tiers.forEach((tier, i) => {
+      const pip = el('div', `tier${i < claimed ? ' got' : ''}${i === claimed ? ' next' : ''}${tier.cosmetic ? ' prize' : ''}`)
       pip.title = `${tier.name} · ${tier.xp} xp`
-      pip.append(el('b', '', String(i + 1)), el('small', '', tier.name))
+      pip.append(el('b', '', String(i + 1)), el('small', '', tierReward(tier)))
       track.append(pip)
     })
     panel.append(track)
-    this.stagger(panel)
+    panel.append(el('p', 'lede', `Season xp comes from matches and challenges. The season ends with coins for your peak rank, and a title at Gold or higher.`))
+  }
+
+  private careerMastery(panel: HTMLElement, profile: Profile): void {
+    panel.append(el('p', 'lede', 'Mastery is a record of time spent, not power. Rewards are cosmetic.'))
+    for (const [kind, label, items, book] of [
+      ['ability', 'Abilities', ABILITIES, profile.abilityMastery],
+      ['core', 'Cores', CORES, profile.mastery],
+    ] as const) {
+      panel.append(el('div', 'section', label))
+      const grid = el('div', 'grid')
+      const sorted = [...items].sort((a, b) => (book[b.id] ?? 0) - (book[a.id] ?? 0))
+      for (const item of sorted) {
+        const m = masteryLevel(book[item.id] ?? 0)
+        const card = el('div', `mastery${m.max ? ' max' : ''}`)
+        const head = el('div', 'mastery-head')
+        head.append(el('strong', '', item.name), el('b', 'mbadge', `M${m.level}`))
+        card.append(head, bar(m.max ? 1 : m.have / m.need, '', m.max ? 'Max' : `${m.have}/${m.need}`))
+        const next = nextMasteryReward(kind, item.id, m.level)
+        if (next) card.append(el('small', '', `M${next.level}: ${next.name}`))
+        grid.append(card)
+      }
+      panel.append(grid)
+    }
+  }
+
+  private careerAwards(panel: HTMLElement, profile: Profile): void {
+    const total = ACHIEVEMENTS.reduce((s, a) => s + a.tiers.length, 0)
+    const got = ACHIEVEMENTS.reduce((s, a) => s + (profile.achievements[a.id] ?? 0), 0)
+    panel.append(bar(got / total, 'Awards', `${got}/${total}`))
+    const list = el('div', 'stack')
+    const rows = ACHIEVEMENTS.map((def) => ({ def, p: achievementProgress(profile, def) }))
+    rows.sort((a, b) => Number(a.p.target === null) - Number(b.p.target === null) || progressOf(b.p) - progressOf(a.p))
+    for (const { def, p } of rows) {
+      const complete = p.target === null
+      const row = el('div', `ach${complete ? ' done' : ''}`)
+      const pips = el('span', 'tier-pips')
+      def.tiers.forEach((_, i) => pips.append(el('i', i < p.tier ? 'on' : '')))
+      const target = p.target ?? def.tiers[def.tiers.length - 1]!
+      const shown = Math.min(Math.floor(p.value * 10) / 10, target)
+      const body = el('div', '')
+      body.append(bar(complete ? 1 : p.value / target, def.name, complete ? 'Complete' : `${shown}/${target}`))
+      const reward = def.grant ? cosmeticById(def.grant)?.name : ''
+      body.append(el('small', '', `${def.detail.replace('{n}', String(target))}${complete ? '' : ` · +${def.coins[p.tier]} coins`}${reward ? ` · final: ${reward}` : ''}`))
+      row.append(pips, body)
+      list.append(row)
+    }
+    panel.append(list)
   }
 
   showCollection(profile: Profile): void {
@@ -450,11 +634,30 @@ export class Shell {
     countUp(coins, outcome.coinsGained, 900, '', '+')
     rewards.append(coins)
     card.append(rewards)
+    if (outcome.xpLines.length > 1) {
+      const lines = el('div', 'xp-lines')
+      for (const line of outcome.xpLines) {
+        const row = el('div', '')
+        row.append(el('span', '', line.label), el('b', '', `+${line.xp}`))
+        lines.append(row)
+      }
+      card.append(lines)
+    }
+    if (outcome.rankMove) {
+      const label = rankName(profile.rank.rating).label
+      card.append(el('div', `rank-move ${outcome.rankMove}`, outcome.rankMove === 'up' ? `PROMOTED · ${label}` : `DOWN TO ${label}`))
+    }
     const grants = el('div', 'grants')
     if (outcome.levelUp > 0) grants.append(el('div', 'grant', `LEVEL UP · ${after.level}`))
-    for (const g of outcome.grants.slice(0, 3)) grants.append(el('div', 'grant', `${g.name} · ${g.detail}`))
+    grants.append(...grantChips(outcome.grants, 6).children)
     if (grants.childElementCount) card.append(grants)
     card.append(el('p', 'lede', result.competitive ? outcome.rankReason : 'Casual. Your rank did not change.'))
+    const mastery = el('div', 'grid res-mastery')
+    for (const m of outcome.mastery) {
+      const lvl = masteryLevel(m.xp)
+      mastery.append(bar(lvl.max ? 1 : lvl.have / lvl.need, `${m.name} M${lvl.level}${m.levelsGained ? ' ▲' : ''}`, `+${m.gained}`))
+    }
+    if (mastery.childElementCount) card.append(mastery)
     const changed = outcome.challenges.filter((c) => c.progress > 0)
     for (const c of changed.slice(0, 3)) card.append(bar(Math.min(1, c.progress / c.target), c.name, c.done ? 'Done' : `${Math.min(c.progress, c.target)}/${c.target}`))
 
@@ -712,17 +915,22 @@ export class Shell {
     top.append(who, el('div', 'coins', String(profile.coins)))
     card.append(top, bar(lvl.have / lvl.need, '', `${lvl.have}/${lvl.need} xp`))
     const next = profile.challenges.daily.find((id) => !profile.challenges.done.includes(id)) ?? profile.challenges.daily[0]
-    const def = CHALLENGES.find((c) => c.id === next)
+    const def = next ? challengeDef(next) : undefined
     if (def) {
       const prog = Math.min(profile.challenges.progress[def.id] ?? 0, def.target)
       const goal = el('div', 'goal')
       goal.append(el('b', 'tag', 'DAILY'), el('span', '', def.detail), el('small', '', `${prog}/${def.target}`))
       card.append(goal)
     }
+    const perks: string[] = []
+    if (profile.daily.firstWinDay !== dateKey()) perks.push('First win bonus ready')
+    const streak = liveDayStreak(profile)
+    if (streak > 1) perks.push(`Day streak ${streak}`)
+    if (perks.length) card.append(el('div', 'perks', perks.join(' · ')))
     return card
   }
 
-  private pick<T extends { id: string; name: string; blurb: string }>(title: string, key: string, items: T[], current: string, choose: (id: string) => void): HTMLElement {
+  private pick<T extends { id: string; name: string; blurb: string }>(title: string, key: string, items: T[], current: string, choose: (id: string) => void, badge?: (id: string) => string): HTMLElement {
     const wrap = el('div', 'stack')
     const head = el('div', 'section', title)
     if (key) head.append(el('kbd', '', key))
@@ -731,7 +939,9 @@ export class Shell {
     for (const item of items) {
       const b = button('', 'choice', () => choose(item.id))
       if (item.id === current) b.classList.add('active')
-      b.append(el('strong', '', item.name), el('small', '', item.blurb))
+      const name = el('strong', '', item.name)
+      if (badge) name.append(el('b', 'mbadge', badge(item.id)))
+      b.append(name, el('small', '', item.blurb))
       grid.append(b)
     }
     wrap.append(grid)
@@ -814,6 +1024,66 @@ function arenaThumb(arena: ArenaDef | null): HTMLCanvasElement {
     g.stroke()
   }
   return c
+}
+
+function grantChips(grants: Grant[], limit: number): HTMLElement {
+  const wrap = el('div', 'grants')
+  const ordered = [...grants].sort((a, b) => GRANT_ORDER.indexOf(a.kind) - GRANT_ORDER.indexOf(b.kind))
+  const shown = ordered.slice(0, limit)
+  for (const g of shown) wrap.append(el('div', `grant ${g.kind}`, `${g.name} · ${g.detail}`))
+  if (ordered.length > shown.length) {
+    const more = el('div', 'grant more', `+${ordered.length - shown.length} more`)
+    more.title = ordered.slice(shown.length).map((g) => `${g.name} · ${g.detail}`).join('\n')
+    wrap.append(more)
+  }
+  return wrap
+}
+
+/** Rewards paid on load: a season that ended, or items added to tracks already passed. */
+function noticeCard(grants: Grant[]): HTMLElement {
+  const card = el('div', 'notice')
+  const ended = grants.find((g) => g.id.startsWith('season-end'))
+  card.append(el('b', '', ended ? ended.name.toUpperCase() : 'REWARDS WAITING'))
+  const rest = grants.filter((g) => g !== ended)
+  if (rest.length) card.append(grantChips(rest, 5))
+  if (ended) card.append(el('small', '', ended.detail))
+  return card
+}
+
+function statGrid(items: [string, string][]): HTMLElement {
+  const grid = el('div', 'stats')
+  for (const [k, v] of items) {
+    const d = el('div', 'stat')
+    d.append(el('b', '', v), el('span', '', k))
+    grid.append(d)
+  }
+  return grid
+}
+
+/** Where the rating sits between this tier's floor and the next. */
+function rankLadder(rating: number): HTMLElement {
+  const i = rankTierIndex(rating)
+  const tier = RANK_TIERS[i]!
+  const next = RANK_TIERS[i + 1]
+  if (!next) return bar(1, `${rating}`, 'Top tier')
+  return bar((rating - tier.min) / (next.min - tier.min), `${rating}`, `${next.min - rating} to ${next.name}`)
+}
+
+function tierReward(tier: { cosmetic?: string; coins?: number; name: string }): string {
+  if (tier.cosmetic) return cosmeticById(tier.cosmetic)?.name ?? tier.name
+  return `${tier.coins ?? 0} coins`
+}
+
+function nextMasteryReward(kind: 'core' | 'ability', id: string, level: number): { level: number; name: string } | null {
+  for (let l = level + 1; l <= MASTERY_MAX; l++) {
+    const reward = masteryReward(kind, id, l)
+    if (reward) return { level: l, name: cosmeticById(reward)?.name ?? reward }
+  }
+  return null
+}
+
+function progressOf(p: { value: number; target: number | null }): number {
+  return p.target ? Math.min(1, p.value / p.target) : 1
 }
 
 function gauge(className: string, r: number): [HTMLElement, SVGCircleElement] {
