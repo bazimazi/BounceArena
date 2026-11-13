@@ -219,19 +219,21 @@ export interface WallHit {
   y2: number
   restitution: number
   lethal: boolean
+  /** Spin about the arena origin in rad/s. A moving blade carries the ball with it. */
+  spin: number
 }
 
 export function wallSegments(walls: WallDef[], time: number): WallHit[] {
   return walls.map((w) => {
     if (!w.spin) {
-      return { x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2, restitution: w.restitution, lethal: w.lethal }
+      return { x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2, restitution: w.restitution, lethal: w.lethal, spin: 0 }
     }
     const c = Math.cos(time * w.spin)
     const s = Math.sin(time * w.spin)
     const rot = (x: number, y: number) => ({ x: x * c - y * s, y: x * s + y * c })
     const a = rot(w.x1, w.y1)
     const b = rot(w.x2, w.y2)
-    return { x1: a.x, y1: a.y, x2: b.x, y2: b.y, restitution: w.restitution, lethal: w.lethal }
+    return { x1: a.x, y1: a.y, x2: b.x, y2: b.y, restitution: w.restitution, lethal: w.lethal, spin: w.spin }
   })
 }
 
@@ -252,7 +254,10 @@ export function resolveCircleWall(
   const pen = radius - hit.dist
   x += nx * pen
   y += ny * pen
-  const vn = vx * nx + vy * ny
+  // Velocity of the wall where it touches the ball (zero unless it spins).
+  const wvx = -wall.spin * hit.qy
+  const wvy = wall.spin * hit.qx
+  const vn = (vx - wvx) * nx + (vy - wvy) * ny
   if (vn < 0) {
     const e = wall.restitution
     vx -= (1 + e) * vn * nx

@@ -14,10 +14,10 @@ import {
   type ScriptEvent,
 } from '../core/types'
 import { TUNE } from '../data/tuning'
-import { arenaById, type ArenaDef, type HazardDef } from '../data/content'
+import { arenaById, mutatorById, type ArenaDef, type HazardDef } from '../data/content'
 import { createBody, seedPhase, type Body } from './body'
 import { resolveCircleWall, supportAt, wallSegments, type Shrink } from './geometry'
-import { resolvePair, capSpeed, type ImpactBody } from './impact'
+import { resolvePair, capSpeed, heatMul, type ImpactBody } from './impact'
 import { applyMotion, type MotionMods } from './motion'
 import {
   applyEnvironment,
@@ -84,6 +84,7 @@ export class Match {
   inputLog: InputFrame[][] = []
   replayMode = false
   silent = false
+  readonly mutators: readonly string[]
   private script: ScriptEvent[]
   private scriptCursor = 0
   private readonly record: boolean
@@ -92,7 +93,8 @@ export class Match {
     this.config = config
     this.arena = arenaById(config.arenaId)
     this.record = config.recordReplay
-    this.players = config.players.map((p) => createBody(p, config.stocks, config.competitive))
+    this.mutators = config.mutators ?? []
+    this.players = config.players.map((p) => createBody(p, config.stocks, config.competitive, this.mutators))
     this.players.forEach((p, i) => seedPhase(p, config.seed + i * 17))
     this.bodies = [...this.players]
     this.placeInitial()
@@ -113,6 +115,12 @@ export class Match {
   }
 
   step(live: Record<string, Partial<InputFrame>> = {}): void {
+    // Where every ball was at the start of the tick. The renderer blends from here.
+    for (const b of this.bodies) {
+      b.prevX = b.x
+      b.prevY = b.y
+      b.prevH = b.falling ? b.fallHeight : b.height
+    }
     this.decayPresentation(DT)
     if (this.status === 'finished') return
     if (this.status === 'celebrate') {
@@ -126,7 +134,8 @@ export class Match {
       if (this.countdownTicks === 0) {
         this.status = 'playing'
         this.goFlash = 0.75
-        this.announce('GO', 'Speed is power', 2)
+        const twists = this.mutators.map((id) => mutatorById(id)?.name).filter(Boolean)
+        this.announce(twists.length ? 'TWIST' : 'GO', twists.length ? twists.join(' + ') : 'Speed is power', 2)
       }
       return
     }
@@ -244,6 +253,7 @@ export class Match {
         time: this.time,
         onSolid: (x, y) => supportAt(this.arena.solids, x, y, this.time, this.shrink, DT).edgeDist >= -4,
         addWell: (w) => this.wells.push(w),
+        addHeat: (o, raw) => this.addHeat(o, this.heatFrom(raw) * 0.55),
         addDecoy: (d) => {
           const existing = this.bodies.find((o) => o.decoy && o.ownerId === b.id)
           if (existing) existing.remove = true
@@ -393,7 +403,9 @@ export class Match {
     if (outcome.power < 40 && outcome.kind === 'separate') return
     const attacker = outcome.attacker === 0 ? a : outcome.attacker === 1 ? b : null
     const victim = outcome.attacker === 0 ? b : outcome.attacker === 1 ? a : null
-    if (attacker && victim && outcome.power > 30) this.noteHit(attacker, victim, outcome.power, outcome.kind)
+    // Stats, numbers, and heat use the hit's own power; the victim's heat label shows how far it went.
+    const shown = outcome.base ?? outcome.power
+    if (attacker && victim && outcome.power > 30) this.noteHit(attacker, victim, shown, outcome.kind)
     if (outcome.popA && a.decoy) a.remove = true
     if (outcome.popB && b.decoy) b.remove = true
     if (outcome.power > 120) {
@@ -405,7 +417,7 @@ export class Match {
         color: (attacker ?? a).color,
         actorId: attacker?.decoy ? attacker.ownerId : attacker?.id ?? '',
         victimId: victim?.id ?? '',
-        text: outcome.power > 280 ? String(Math.round(outcome.power)) : '',
+        text: shown > 280 ? String(Math.round(shown)) : '',
       })
     }
   }
@@ -421,6 +433,8 @@ export class Match {
     victim.lastHitHazard = false
     owner.stats.damage += power
     owner.stats.hits += 1
+    // Bumps and glancing trades barely heat a ball; committed strikes do.
+    this.addHeat(victim, this.heatFrom(power) * (kind === 'trade' ? 0.35 : 1))
     victim.stats.damageTaken += power
     if (power > owner.stats.bestImpact) owner.stats.bestImpact = power
     if (this.config.modeId === 'score') owner.stats.score += power * 0.05
@@ -455,6 +469,17 @@ export class Match {
     }
   }
 
+  /** Heat earned from a push of `power` (before any heat multiplier). Shared by hits, abilities, and blasts. */
+  private heatFrom(power: number): number {
+    return Math.max(0, power - 60) * TUNE.heatGain * (this.mutators.includes('overheat') ? 1.8 : 1)
+  }
+
+  private addHeat(b: Body, amount: number): void {
+    if (b.decoy || amount <= 0) return
+    b.heat = Math.min(TUNE.heatMax, b.heat + amount)
+    if (b.heat > b.stats.peakHeat) b.stats.peakHeat = b.heat
+  }
+
   private trackLaunch(victim: Body, attackerId: string): void {
     victim.launching = true
     victim.launchFromX = victim.x
@@ -466,8 +491,9 @@ export class Match {
   private modsFor(b: Body): MotionMods {
     const mods = blankMods(b.edgeDist)
     const hazards = this.allHazards()
-    applyEnvironment(mods, hazards, b, this.time, this.lowG)
+    applyEnvironment(mods, hazards, b, this.time, this.lowG > 0 || this.mutators.includes('lowgrav') ? 1 : 0)
     if (b.surface === 'launch') mods.rubber = true
+    if (this.mutators.includes('ice')) mods.ice = true
     return mods
   }
 
@@ -637,7 +663,9 @@ export class Match {
           if (d > ev.r) continue
           const nx = d < 1 ? 1 : (b.x - ev.x) / d
           const ny = d < 1 ? 0 : (b.y - ev.y) / d
-          const kick = 640 * (1 - d / ev.r)
+          const raw = 640 * (1 - d / ev.r)
+          const kick = raw * heatMul(b.heat)
+          this.addHeat(b, this.heatFrom(raw) * 0.5)
           b.vx += nx * kick
           b.vy += ny * kick
           capSpeed(b)
@@ -730,6 +758,8 @@ export class Match {
           b.x = other.x + (dx / d) * (other.r + b.radius + 10)
           b.y = other.y + (dy / d) * (other.r + b.radius + 10)
           b.portalCd = 0.6
+          b.prevX = b.x
+          b.prevY = b.y
           this.pushFx({ type: 'ability', x: b.x, y: b.y, power: 1, color: other.color, actorId: b.id, victimId: '', text: '' })
           break
         }
@@ -904,6 +934,7 @@ export class Match {
     b.fallVel = 0
     b.deepFall = false
     b.invuln = TUNE.spawnInvuln
+    b.heat = 0
     b.supported = true
     b.dashTime = 0
     this.pushFx({ type: 'spawn', x: b.x, y: b.y, power: 1, color: b.color, actorId: b.id, victimId: '', text: '' })
@@ -939,7 +970,8 @@ export class Match {
       p.placement = i + 1
     })
     const top = order[0]
-    if (this.config.teams && top) this.winnerIds = this.players.filter((p) => p.team === top.team).map((p) => p.id)
+    // A ball that forfeited never shares the win, even when its team takes the match.
+    if (this.config.teams && top) this.winnerIds = this.players.filter((p) => p.team === top.team && p.id !== forfeiter).map((p) => p.id)
     else if (top) this.winnerIds = [top.id]
     else this.winnerIds = []
     if (top?.stats.behindAtMid && reason !== 'forfeit') {
@@ -1084,6 +1116,7 @@ function toPlacement(p: Body, winners: string[]): Placement {
     longestLife: p.stats.longestLife,
     firstElimAt: p.stats.firstElimAt,
     behindAtMid: p.stats.behindAtMid,
+    peakHeat: Math.round(p.stats.peakHeat),
     won: winners.includes(p.id),
   }
 }

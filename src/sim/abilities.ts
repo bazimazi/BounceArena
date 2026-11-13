@@ -1,5 +1,5 @@
 import { hypot } from '../core/math'
-import { capSpeed } from './impact'
+import { capSpeed, heatMul } from './impact'
 import type { Body } from './body'
 import { createBody } from './body'
 
@@ -18,6 +18,8 @@ export interface CastContext {
   onSolid: (x: number, y: number) => boolean
   addWell: (w: Well) => void
   addDecoy: (d: Body) => void
+  /** Heat from a push of `raw` power, before heat scaling. */
+  addHeat: (b: Body, raw: number) => void
 }
 
 export function castAbility(body: Body, ctx: CastContext): number {
@@ -138,7 +140,9 @@ function radial(body: Body, ctx: CastContext, radius: number, power: number, dir
     const fall = 1 - d / radius
     const nx = (dx / d) * dir
     const ny = (dy / d) * dir
-    const kick = power * fall / Math.sqrt(Math.max(0.4, o.mass))
+    const raw = power * fall / Math.sqrt(Math.max(0.4, o.mass))
+    const kick = raw * heatMul(o.heat)
+    ctx.addHeat(o, raw)
     o.vx += nx * kick
     o.vy += ny * kick
     capSpeed(o)
@@ -160,7 +164,9 @@ function cone(body: Body, ctx: CastContext, steer: { x: number; y: number }, rad
     if (d > radius || d < 1) continue
     const dot = (dx * steer.x + dy * steer.y) / d
     if (dot < minDot) continue
-    const kick = power * dot * (1 - d / radius) / Math.sqrt(Math.max(0.4, o.mass))
+    const raw = power * dot * (1 - d / radius) / Math.sqrt(Math.max(0.4, o.mass))
+    const kick = raw * heatMul(o.heat)
+    ctx.addHeat(o, raw)
     o.vx += steer.x * kick
     o.vy += steer.y * kick
     capSpeed(o)

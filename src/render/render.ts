@@ -13,6 +13,19 @@ export interface RenderPrefs {
   colorblind: boolean
   reducedMotion: boolean
   numbers?: boolean
+  /** Full-screen flashes and inverted impact frames. Off for photosensitive players. */
+  flashes?: boolean
+}
+
+/** Heat colour ramp: white, yellow, orange, red, then deep red past 200%. */
+export function heatColor(heat: number): string {
+  const stops: [number, string][] = [[0, '#f4f7fb'], [45, '#ffe066'], [90, '#ff9f3a'], [140, '#ff4d3a'], [200, '#b0102a']]
+  for (let i = 1; i < stops.length; i++) {
+    const [h1, c1] = stops[i]!
+    const [h0, c0] = stops[i - 1]!
+    if (heat <= h1) return mixHex(c0, c1, (heat - h0) / (h1 - h0))
+  }
+  return stops[stops.length - 1]![1]
 }
 
 type Project = (x: number, y: number) => { x: number; y: number }
@@ -48,6 +61,8 @@ interface Particle {
   spin: number
   drag: number
   seed: number
+  /** Victim id for merged hit numbers. */
+  owner?: string
 }
 
 interface Star {
@@ -101,6 +116,7 @@ export class Renderer {
   private lastNow = 0
   private matchRef: Match | null = null
   private speedLines = 0
+  private jitterId = ''
   width = 1
   height = 1
 
@@ -157,7 +173,7 @@ export class Renderer {
     if (this.finish) return
     this.finish = { x, y, life: 1.5, max: 1.5, color }
     if (!prefs.reducedMotion) this.slow = 1.25
-    this.flashA = Math.max(this.flashA, 0.35)
+    if (prefs.flashes !== false) this.flashA = Math.max(this.flashA, 0.35)
     this.flashColor = color
     this.trauma = Math.min(1, this.trauma + 0.4 * prefs.shake)
   }
@@ -203,7 +219,8 @@ export class Renderer {
         this.add('flash', e.x, e.y, 0, 0, 14 + k * 38, '#ffffff', 0.09 + k * 0.05, 0)
         this.impactStyle(actor?.impact ?? 'impact_ring', e.x, e.y, e.color, k, full)
         if (e.power > 560 && full) this.bolts(e.x, e.y, Math.atan2(ny, nx), k)
-        if (e.text && prefs.numbers !== false) this.popNumber(e.x, e.y - 18, e.text, e.power)
+        if (e.text && prefs.numbers !== false) this.popNumber(e.x, e.y - 18, e.text, e.power, e.victimId)
+        if (victim) this.jitterId = victim.id
         if (victim) {
           const fx = this.fxFor(victim)
           fx.squashAng = Math.atan2(ny, nx)
@@ -221,7 +238,7 @@ export class Renderer {
           this.punch = Math.max(this.punch, k * 0.06 * motion)
         }
         if (local || e.power > 640) this.hitstop = Math.max(this.hitstop, clamp(0.016 + k * 0.085, 0.02, 0.11))
-        if (local && e.power > 780 && full && !prefs.reducedMotion) this.impactFrames = 1
+        if (local && e.power > 780 && full && !prefs.reducedMotion && prefs.flashes !== false) this.impactFrames = 1
       } else if (e.type === 'dash') {
         const b = match.bodies.find((x) => x.id === e.actorId)
         const a = b ? Math.atan2(b.vy, b.vx) + Math.PI : Math.random() * TAU
@@ -261,8 +278,10 @@ export class Renderer {
           else this.add('spark', e.x, e.y, Math.cos(a) * s * 1.3, Math.sin(a) * s * 1.3, 2.5, c, 0.4 + Math.random() * 0.3, 3)
         }
         this.add('stamp', e.x, e.y - 30, 0, -24, local ? 34 : 24, e.victimId === localId ? '#ff4d3a' : '#fff7ea', 1.05, 0, (Math.random() - 0.5) * 0.3, 'KO!')
-        this.flashA = Math.max(this.flashA, (local ? 0.32 : 0.1) * motion)
-        this.flashColor = color
+        if (prefs.flashes !== false) {
+          this.flashA = Math.max(this.flashA, (local ? 0.32 : 0.1) * motion)
+          this.flashColor = color
+        }
         this.trauma = Math.min(1, this.trauma + (local ? 0.55 : 0.22) * shake)
         if (local) {
           this.hitstop = Math.max(this.hitstop, 0.12)
@@ -325,8 +344,38 @@ export class Renderer {
     }
   }
 
+  /**
+   * Draws the match blended `alpha` of the way from the previous tick to the current one, so motion
+   * stays smooth on 90/120/144 Hz screens while the sim ticks at 60 Hz. Positions are swapped in
+   * for the draw and restored afterwards; the sim never sees them.
+   */
   draw(match: Match, alpha: number, prefs: RenderPrefs, biasX: number, spectateId: string): void {
-    void alpha
+    const a = clamp(alpha, 0, 1)
+    const saved: [Body, number, number, number, number][] = []
+    if (a < 0.999) {
+      for (const b of match.bodies) {
+        // Teleports (respawn, blink, portals) snap instead of smearing across the floor.
+        if (Math.hypot(b.x - b.prevX, b.y - b.prevY) > 120) continue
+        saved.push([b, b.x, b.y, b.height, b.fallHeight])
+        b.x = lerp(b.prevX, b.x, a)
+        b.y = lerp(b.prevY, b.y, a)
+        if (b.falling) b.fallHeight = lerp(b.prevH, b.fallHeight, a)
+        else b.height = lerp(b.prevH, b.height, a)
+      }
+    }
+    try {
+      this.drawFrame(match, prefs, biasX, spectateId)
+    } finally {
+      for (const [b, x, y, h, f] of saved) {
+        b.x = x
+        b.y = y
+        b.height = h
+        b.fallHeight = f
+      }
+    }
+  }
+
+  private drawFrame(match: Match, prefs: RenderPrefs, biasX: number, spectateId: string): void {
     const w = this.canvas.width
     const h = this.canvas.height
     const now = performance.now()
@@ -341,11 +390,15 @@ export class Renderer {
 
     const dpr = this.dpr
     const focus = match.players.find((p) => p.id === spectateId && p.alive) ?? match.players.find((p) => p.alive)
+    // Portrait phones would fit the arena to the narrow side and waste most of the screen.
+    // Zoom in and let the camera follow the local ball further instead.
+    const tall = clamp((h / Math.max(1, w) - 1.05) / 0.9, 0, 1)
+    const reach = match.arena.view * 0.42 * tall
     let tx = 0
     let ty = 0
     if (focus) {
-      tx = clamp(focus.x + focus.vx * 0.06, -70, 70)
-      ty = clamp(focus.y + focus.vy * 0.06, -50, 50)
+      tx = clamp(focus.x + focus.vx * 0.06, -70 - reach * 0.6, 70 + reach * 0.6)
+      ty = clamp(focus.y + focus.vy * 0.06, -50 - reach, 50 + reach)
     }
     let finishZoom = 0
     if (this.finish) {
@@ -361,7 +414,7 @@ export class Renderer {
     this.camX = lerp(this.camX, tx, follow)
     this.camY = lerp(this.camY, ty, follow)
     this.punch *= Math.exp(-9 * dt)
-    const baseZoom = Math.min(w, h) / (match.arena.view * 2 * 1.12)
+    const baseZoom = (Math.min(w, h) / (match.arena.view * 2 * 1.12)) * (1 + tall * 0.42)
     this.camZoom = lerp(this.camZoom, 1 + finishZoom, 1 - Math.exp(-7 * dt))
     const zoom = baseZoom * (this.camZoom + this.punch)
 
@@ -376,7 +429,8 @@ export class Renderer {
     this.kickY += this.kickVY * dt
 
     const originX = w / 2 + biasX * dpr + sx + this.kickX * dpr
-    const originY = h / 2 + sy + this.kickY * dpr
+    // On tall screens the controls cover the bottom, so the play view sits a little higher.
+    const originY = h / 2 - tall * h * 0.06 + sy + this.kickY * dpr
     const camX = this.camX
     const camY = this.camY
     const project: Project = (x, y) => ({
@@ -422,16 +476,22 @@ export class Renderer {
 
     this.drawParticles(project, zoom, dt, prefs)
 
-    const placed: { x: number; y: number }[] = []
+    // Labels stack upward when they would overlap, using their real widths.
+    this.labelScale = clamp(Math.min(w, h) / dpr / 720, 0.8, 1)
+    const placed: { x: number; y: number; w: number }[] = []
+    const rowH = 21 * dpr * this.labelScale
     for (const b of sorted) {
       if (b.decoy) continue
       const p = project(b.x, b.y)
-      let lift = Math.max(0, b.height) * zoom * 0.85
-      for (const other of placed) {
-        if (Math.abs(other.x - p.x) < 80 * dpr && Math.abs(other.y - (p.y - lift)) < 20 * dpr) lift += 18 * dpr
+      const lw = this.labelWidth(b)
+      let y = p.y - Math.max(0, b.height) * zoom * 0.85
+      for (let guard = 0; guard < 6; guard++) {
+        const hit = placed.some((o) => Math.abs(o.x - p.x) < (o.w + lw) / 2 + 4 * dpr && Math.abs(o.y - y) < rowH)
+        if (!hit) break
+        y -= rowH
       }
-      placed.push({ x: p.x, y: p.y - lift })
-      this.label(b, p.x, p.y - lift, zoom, b.id === spectateId && !match.silent, match.config.teams ? teamColor(b.team) : '')
+      placed.push({ x: p.x, y, w: lw })
+      this.label(b, p.x, y, zoom, b.id === spectateId && !match.silent, match.config.teams ? teamColor(b.team) : '')
     }
 
     this.screenFx(match, w, h, dt, prefs, focus, spectateId)
@@ -1248,8 +1308,10 @@ export class Renderer {
     const h = b.falling ? b.fallHeight : b.height
     const lift = h * zoom * 0.85
     let r = b.radius * zoom * (1 + Math.max(0, lift) * 0.0016)
-    const x = p.x
-    const y = p.y - lift
+    // During hitstop the struck ball shudders in place, which sells the freeze.
+    const shudder = this.hitstop > 0 && b.id === this.jitterId && !prefs.reducedMotion ? 3 * this.dpr : 0
+    const x = p.x + (shudder ? (Math.random() - 0.5) * 2 * shudder : 0)
+    const y = p.y - lift + (shudder ? (Math.random() - 0.5) * 2 * shudder : 0)
     let sink = 0
     if (b.falling && b.fallHeight < 0) {
       sink = clamp(-b.fallHeight / 32, 0, 1)
@@ -1331,6 +1393,22 @@ export class Renderer {
     const T = this.clock
     const ringR = r + 7 * dpr
     ctx.lineCap = 'round'
+    if (b.heat > 40) {
+      // Heat glow: warmer and faster as the ball gets easier to launch.
+      const k = clamp((b.heat - 40) / 140, 0, 1)
+      const beat = prefs.reducedMotion ? 0.5 : 0.5 + Math.sin(T * (4 + k * 10)) * 0.5
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      const glow = ctx.createRadialGradient(0, 0, r * 0.8, 0, 0, r + (10 + k * 16) * dpr)
+      glow.addColorStop(0, hexA(heatColor(b.heat), 0))
+      glow.addColorStop(0.55, hexA(heatColor(b.heat), (0.18 + k * 0.32) * (0.6 + beat * 0.4)))
+      glow.addColorStop(1, hexA(heatColor(b.heat), 0))
+      ctx.fillStyle = glow
+      ctx.beginPath()
+      ctx.arc(0, 0, r + (10 + k * 16) * dpr, 0, TAU)
+      ctx.fill()
+      ctx.restore()
+    }
     ctx.beginPath()
     ctx.arc(0, 0, ringR, 0, TAU)
     ctx.strokeStyle = 'rgba(0,0,0,0.35)'
@@ -1475,9 +1553,28 @@ export class Renderer {
     ctx.stroke()
   }
 
+  private labelScale = 1
+
+  private heatText(b: Body): string {
+    return b.heat >= 1 ? `${Math.floor(b.heat)}%` : ''
+  }
+
+  private labelWidth(b: Body): number {
+    const ctx = this.ctx
+    const dpr = this.dpr * this.labelScale
+    ctx.font = `700 ${12 * dpr}px Barlow, "Segoe UI", sans-serif`
+    let w = ctx.measureText(b.name).width + 14 * dpr
+    const heat = this.heatText(b)
+    if (heat) {
+      ctx.font = `800 ${14 * dpr}px "Barlow Condensed", Impact, sans-serif`
+      w += ctx.measureText(heat).width * 2 + 10 * dpr
+    }
+    return w
+  }
+
   private label(b: Body, x: number, y: number, zoom: number, local: boolean, team = ''): void {
     const ctx = this.ctx
-    const dpr = this.dpr
+    const dpr = this.dpr * this.labelScale
     const above = b.radius * zoom + 24 * dpr
     const ty = y - above
     ctx.save()
@@ -1499,6 +1596,20 @@ export class Renderer {
     }
     ctx.fillStyle = local ? '#0b0f14' : '#f4f7fb'
     ctx.fillText(name, x, ty + 0.5 * dpr)
+    const heat = this.heatText(b)
+    if (heat) {
+      // Damage percent beside the name, coloured by how launchable the ball is.
+      ctx.save()
+      ctx.font = `800 ${14 * dpr}px "Barlow Condensed", Impact, sans-serif`
+      ctx.textAlign = 'left'
+      ctx.lineJoin = 'round'
+      ctx.lineWidth = 3.5 * dpr
+      ctx.strokeStyle = 'rgba(6,10,16,0.9)'
+      ctx.strokeText(heat, x + pw / 2 + 4 * dpr, ty + 0.5 * dpr)
+      ctx.fillStyle = heatColor(b.heat)
+      ctx.fillText(heat, x + pw / 2 + 4 * dpr, ty + 0.5 * dpr)
+      ctx.restore()
+    }
     const stocks = Math.max(0, Math.min(5, b.stocks))
     for (let i = 0; i < stocks; i++) {
       ctx.beginPath()
@@ -1728,10 +1839,26 @@ export class Renderer {
     this.add('ring', x, y, 0, 0, size, color, life, 0, 0, '', width)
   }
 
-  private popNumber(x: number, y: number, text: string, power: number): void {
+  private popNumber(x: number, y: number, text: string, power: number, owner: string): void {
     // Smash damage colours: white, yellow, red, maroon.
     const color = power < 420 ? '#f4f7fb' : power < 620 ? '#ffc14d' : power < 820 ? '#ff4d3a' : '#c2182b'
-    this.add('text', x, y, (Math.random() - 0.5) * 30, -70, 14 + Math.min(14, power / 60), color, 0.85, 3, (Math.random() - 0.5) * 0.2, text)
+    const size = 14 + Math.min(14, power / 60)
+    // A flurry on one ball shows one number that grows, not a pile of overlapping digits.
+    const live = owner ? this.particles.find((p) => p.kind === 'text' && p.owner === owner && p.max - p.life < 0.45) : undefined
+    if (live) {
+      if (Number(text) > Number(live.text)) {
+        live.text = text
+        live.color = color
+        live.size = Math.max(live.size, size)
+      }
+      live.life = live.max
+      live.x = x
+      live.y = y
+      return
+    }
+    this.add('text', x, y, (Math.random() - 0.5) * 30, -70, size, color, 0.85, 3, (Math.random() - 0.5) * 0.2, text)
+    const made = this.particles[this.particles.length - 1]
+    if (made) made.owner = owner
   }
 
   private bolts(x: number, y: number, ang: number, k: number): void {

@@ -10,6 +10,8 @@ import {
   TEAM_COLORS,
   arenaById,
   cosmeticById,
+  dailyTwist,
+  mutatorById,
   dateKey,
   displaySeason,
   MASTERY_LEVELS,
@@ -29,6 +31,7 @@ import { achievementProgress, canReroll, challengeDef, isPodium, liveDayStreak, 
 import { solidPose } from '../sim/geometry'
 import type { FeedItem, Banner, Match } from '../sim/match'
 import type { PlayOptions } from '../game/setup'
+import { heatColor } from '../render/render'
 
 export interface PlayDraft {
   modeId: PlayOptions['modeId']
@@ -99,6 +102,8 @@ interface HudRefs {
   gauge: HTMLElement
   gaugeArc: SVGCircleElement
   gaugeNum: HTMLElement
+  heat: HTMLElement
+  heatNum: HTMLElement
   dash: HTMLElement
   dashArc: SVGCircleElement
   ability: HTMLElement
@@ -114,6 +119,7 @@ export class Shell {
   onTutorial: () => void = () => {}
   onPractice: () => void = () => {}
   onRanked: () => void = () => {}
+  onTwist: () => void = () => {}
   onName: (name: string) => void = () => {}
   onLoadout: (slot: 'core' | 'shell' | 'ability' | 'passive', id: string) => void = () => {}
   onEquip: (id: string) => void = () => {}
@@ -134,6 +140,7 @@ export class Shell {
   private feedNodes = new WeakMap<FeedItem, HTMLElement>()
   private lastBanner: Banner | null = null
   private lastLeft = 0
+  private lastHeat = -1
   private dashReady = true
   private abilityReady = true
   private current = ''
@@ -162,6 +169,14 @@ export class Shell {
     const mode = MODES.find((m) => m.id === this.draft.modeId)
     const arena = ARENAS.find((a) => a.id === this.draft.arenaId)
     play.append(el('small', '', `${mode?.name ?? 'Free-for-All'} · ${arena?.name ?? 'Random arena'} · ${this.draft.players} players`))
+
+    const twist = dailyTwist()
+    const twistTile = button('', 'tile twist', () => this.onTwist())
+    const tone = mutatorById(twist.mutators[0] ?? '')?.color ?? '#ff6b9a'
+    twistTile.style.setProperty('--tone', tone)
+    const twistHead = el('div', 'twist-head')
+    twistHead.append(el('b', 'tag', 'DAILY TWIST'), el('strong', '', twist.name))
+    twistTile.append(twistHead, el('small', '', twist.blurb))
 
     const ranked = button('', 'tile ranked', () => this.onRanked())
     ranked.append(el('strong', '', 'Ranked Duel'), el('small', '', 'Standard ball. Your ability is the signature.'))
@@ -203,7 +218,7 @@ export class Shell {
       name.blur()
     })
     nameRow.append(el('span', '', 'Name'), name)
-    panel.append(play, ranked, row, nav, nameRow)
+    panel.append(play, twistTile, ranked, row, nav, nameRow)
     this.stagger(panel)
   }
 
@@ -540,17 +555,23 @@ export class Shell {
     panel.append(toggle('Reduced effects', 'Fewer particles, no impact frames', profile.settings.fx === 'reduced', (v) => this.onSettings({ fx: v ? 'reduced' : 'full' })))
     panel.append(toggle('Stronger patterns', 'Extra marks on every ball', profile.settings.colorblind, (v) => this.onSettings({ colorblind: v })))
     panel.append(toggle('Speed numbers', 'Show hit power', profile.settings.numbers, (v) => this.onSettings({ numbers: v })))
+    panel.append(toggle('Screen flashes', 'Full-screen flashes on big hits and knockouts', profile.settings.flashes, (v) => this.onSettings({ flashes: v })))
+    panel.append(el('div', 'section', 'Assist'))
+    const psT = Math.max(0, Math.min(1, (profile.settings.practiceSpeed - 0.5) / 0.5))
+    panel.append(slider('Practice speed', psT, (v) => this.onSettings({ practiceSpeed: 0.5 + Math.round(v * 10) / 20 }), (v) => `${Math.round((0.5 + Math.round(v * 10) / 20) * 100)}%`))
     panel.append(el('div', 'section', 'Controls'))
     panel.append(toggle('Mouse steer', 'Steer toward the cursor when no key is held', profile.settings.mouseSteer, (v) => this.onSettings({ mouseSteer: v })))
-    panel.append(toggle('Haptics', 'Vibrate on hits (mobile)', profile.settings.haptics, (v) => this.onSettings({ haptics: v })))
+    panel.append(toggle('Haptics', 'Phone vibration and gamepad rumble', profile.settings.haptics, (v) => this.onSettings({ haptics: v })))
+    const dzT = Math.max(0, Math.min(1, (profile.settings.deadzone - 0.05) / 0.3))
+    panel.append(slider('Stick deadzone', dzT, (v) => this.onSettings({ deadzone: 0.05 + v * 0.3 }), (v) => `${Math.round((0.05 + v * 0.3) * 100)}%`))
     const keys = el('div', 'keys')
     for (const [action, p1, p2] of [
-      ['Steer', 'W A S D', 'Arrows'],
-      ['Dash', 'Space', 'Enter'],
-      ['Ability', 'F', 'Right Ctrl'],
-      ['Brake', 'Shift', 'Right Shift'],
-      ['Emote', 'G', ''],
-      ['Pause', 'Esc', ''],
+      ['Steer', 'W A S D', 'Arrows · Stick'],
+      ['Dash', 'Space', 'A · RT'],
+      ['Ability', 'F E', 'B · X'],
+      ['Brake', 'Shift', 'LT · LB'],
+      ['Emote', 'G', 'Y'],
+      ['Pause', 'Esc', 'Start'],
     ] as const) {
       const row = el('div', '')
       row.append(el('span', '', action), kbds(p1), kbds(p2))
@@ -576,7 +597,8 @@ export class Shell {
     card.style.setProperty('--tone', tone)
 
     const head = el('div', 'res-head')
-    head.append(el('div', 'res-kicker', won ? 'VICTORY' : result.forfeit && place === result.placements.length ? 'FORFEIT' : podium ? 'PODIUM' : result.competitive || result.placements.length <= 2 ? 'DEFEAT' : 'KNOCKED OUT'))
+    const teamWin = won && place > 1 && modeById(result.modeId).teams
+    head.append(el('div', 'res-kicker', teamWin ? 'TEAM VICTORY' : won ? 'VICTORY' : result.forfeit && place === result.placements.length ? 'FORFEIT' : podium ? 'PODIUM' : result.competitive || result.placements.length <= 2 ? 'DEFEAT' : 'KNOCKED OUT'))
     const placeEl = el('div', 'place', placeLabel(place))
     head.append(placeEl, el('div', 'res-name', `${you?.name ?? profile.name} · ${result.competitive ? 'Ranked' : 'Casual'}`))
     card.append(head)
@@ -586,8 +608,8 @@ export class Shell {
       for (const [k, v, fmt] of [
         ['Knockouts', you.elims, ''],
         ['Falls', you.deaths, ''],
-        ['Alive', Math.round(you.survival), 's'],
         ['Best hit', Math.round(you.bestImpact), ''],
+        ['Peak heat', Math.round(you.peakHeat ?? 0), '%'],
       ] as const) {
         const d = el('div', 'stat')
         const b = el('b', '', '0')
@@ -710,6 +732,7 @@ export class Shell {
     this.rosterKey = ''
     this.lastBanner = null
     this.lastLeft = 0
+    this.lastHeat = -1
     this.dashReady = true
     this.abilityReady = true
     this.feedNodes = new WeakMap()
@@ -735,6 +758,11 @@ export class Shell {
     const [g, gaugeArc] = gauge('momentum', 46)
     const gaugeNum = el('b', '', '0')
     g.append(gaugeNum, el('small', '', 'SPEED'))
+    // Your own damage percent, big and coloured like the label over your ball.
+    const heat = el('div', 'heat')
+    const heatNum = el('b', '', '0%')
+    heat.append(heatNum, el('small', '', 'HEAT'))
+    g.append(heat)
     const [ability, abilityArc] = gauge('cd ability', 32)
     const abilityName = el('b', '', 'ABILITY')
     ability.append(abilityName, el('kbd', '', 'F'))
@@ -752,7 +780,7 @@ export class Shell {
     this.hud.append(top, left, feed, banner, callout, hint, spectate, bottom, pause)
     this.refs = {
       phase, timer, left, roster, feed, banner, callout, hint, spectate,
-      gauge: g, gaugeArc, gaugeNum, dash, dashArc, ability, abilityArc, abilityName, pause,
+      gauge: g, gaugeArc, gaugeNum, heat, heatNum, dash, dashArc, ability, abilityArc, abilityName, pause,
     }
   }
 
@@ -865,6 +893,14 @@ export class Shell {
     r.gauge.style.setProperty('--m', mixColor(momentum))
     r.gauge.classList.toggle('max', momentum > 0.85)
     if (you.hitFlash > 0.9) restart(r.gauge, 'hit')
+    const heatNow = you.alive ? Math.floor(you.heat) : 0
+    if (heatNow !== this.lastHeat) {
+      if (heatNow > this.lastHeat && this.lastHeat >= 0) restart(r.heat, 'bump')
+      this.lastHeat = heatNow
+      r.heatNum.textContent = `${heatNow}%`
+      r.heat.style.setProperty('--h', heatColor(heatNow))
+      r.heat.classList.toggle('hot', heatNow >= 100)
+    }
 
     const dashPct = you.dashCdMax <= 0 ? 1 : 1 - Math.min(1, you.dashCd / you.dashCdMax)
     setArc(r.dashArc, dashPct)
@@ -1184,7 +1220,8 @@ function bar(t: number, label: string, value: string): HTMLElement {
 function kbds(text: string): HTMLElement {
   const wrap = el('span', 'kbds')
   if (!text) return wrap
-  for (const part of text.split(' ')) wrap.append(el('kbd', '', part))
+  // "·" separates alternatives (keyboard keys vs pad buttons) and is drawn as a divider, not a key.
+  for (const part of text.split(' ')) wrap.append(part === '·' ? el('i', 'kbd-or', '/') : el('kbd', '', part))
   return wrap
 }
 

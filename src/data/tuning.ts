@@ -39,6 +39,13 @@ export const TUNE = {
   substeps: 2,
   friendlyBump: 0.28,
   edgeWarn: 86,
+  /** Heat gained per point of launch power above 60. A 500 hit adds about 17%. */
+  heatGain: 0.038,
+  /** Extra launch per 100% heat. */
+  heatScale: 0.8,
+  heatMax: 250,
+  /** Most a victim can bend a launch with the stick, in radians (~9 degrees). */
+  diAngle: 0.15,
 } as const
 
 export interface CoreDef {

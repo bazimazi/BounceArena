@@ -1,5 +1,8 @@
 import { DT, ZERO_INPUT, type MatchResult } from '../core/types'
 import { abilityById } from '../data/tuning'
+import { dailyTwist } from '../data/content'
+import { clamp } from '../core/math'
+import type { Body } from '../sim/body'
 import { AudioBus } from '../audio/audio'
 import { attractConfig, buildMatchConfig, type PlayOptions } from '../game/setup'
 import { Input } from '../input/input'
@@ -52,7 +55,42 @@ class App {
     this.bindTouch()
     this.renderer.resize()
     window.addEventListener('resize', () => this.renderer.resize())
+    // Browsers only allow audio after a gesture; the first one starts the menu music too.
+    const unlock = () => {
+      this.audio.resume()
+      window.removeEventListener('pointerdown', unlock)
+      window.removeEventListener('keydown', unlock)
+    }
+    window.addEventListener('pointerdown', unlock)
+    window.addEventListener('keydown', unlock)
+    // Leaving the tab pauses the match and silences the audio instead of playing on unseen.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        this.audio.suspend()
+        this.autoPause()
+      } else this.audio.wake()
+    })
+    window.addEventListener('blur', () => this.autoPause())
+    uiRoot.addEventListener('pointerover', (e) => {
+      if (e.pointerType === 'mouse' && (e.target as HTMLElement).closest?.('button')) this.audio.hover()
+    })
     this.show('menu')
+  }
+
+  /** Practice and Tutorial can run slower as an assist. Scored matches always run at full speed. */
+  private assistSpeed(): number {
+    const mode = this.session?.match.config.modeId
+    if (this.highlight || (mode !== 'practice' && mode !== 'tutorial')) return 1
+    return clamp(this.profile.settings.practiceSpeed || 1, 0.5, 1)
+  }
+
+  private autoPause(): void {
+    const match = this.session?.match
+    if (this.screen !== 'match' || !match || this.paused) return
+    // Spectating after a knockout: togglePause would leave for results, so let it be.
+    const you = match.players.find((p) => p.id === this.youId)
+    if (you && you.eliminated) return
+    if (match.status === 'playing' || match.status === 'sudden' || match.status === 'countdown') this.togglePause()
   }
 
   start(): void {
@@ -68,7 +106,7 @@ class App {
       return
     }
     const live = this.highlight || (this.session && this.screen === 'match' && !this.paused)
-    this.acc += dt * (live ? this.renderer.timeScale(dt) : 1)
+    this.acc += dt * (live ? this.renderer.timeScale(dt) * this.assistSpeed() : 1)
     let steps = 0
     while (this.acc >= DT && steps < 5) {
       this.tick()
@@ -76,6 +114,7 @@ class App {
       steps += 1
     }
     if (steps === 5) this.acc = 0
+    this.pollPad()
     this.draw()
     requestAnimationFrame(this.frame)
   }
@@ -112,10 +151,11 @@ class App {
         const learner = match.players.find((p) => p.id === this.youId)
         if (learner && learner.stats.elims > 0 && match.status === 'playing') match.endNow()
       }
-      const intensity = match.finalPhase || match.status === 'sudden' ? 1 : 0.35
-      this.audio.update(DT, this.screen === 'match' ? intensity : 0)
+      const level = match.status === 'sudden' ? 3 : match.finalPhase ? 2 : match.status === 'countdown' ? 0 : 1
+      this.audio.update(DT, this.screen === 'match' ? level : 0)
       return
     }
+    this.audio.update(DT, 0)
     if (!this.session || this.screen !== 'match') {
       if (this.attract.status === 'finished' || this.attract.status === 'celebrate') {
         this.attract = new Match(attractConfig((this.attract.config.seed + 1) >>> 0))
@@ -127,24 +167,26 @@ class App {
 
   private draw(): void {
     const prefs = this.prefs()
+    const alpha = clamp(this.acc / DT, 0, 1)
     const menu = this.screen !== 'match' && this.screen !== 'results'
     const bias = menu ? Math.min(220, window.innerWidth * 0.18) : 0
     if (this.highlight) {
-      this.renderer.draw(this.highlight, 1, prefs, 0, this.youId)
+      this.renderer.draw(this.highlight, alpha, prefs, 0, this.youId)
       return
     }
     if (this.session && (this.screen === 'match' || this.screen === 'results')) {
       const match = this.session.match
-      this.renderer.draw(match, 1, prefs, 0, this.youId)
+      // After a forfeit the match stops stepping, so blending would shake the results backdrop.
+      this.renderer.draw(match, this.paused || this.screen === 'results' ? 1 : alpha, prefs, 0, this.youId)
       if (this.screen === 'match') {
         this.shell.syncHud(match, this.youId, this.hint(match))
         const you = match.players.find((p) => p.id === this.youId)
         document.body.dataset.out = you && !you.alive && you.eliminated ? 'yes' : ''
-        if (you && this.profile.settings.haptics && you.hitFlash > 0.85 && navigator.vibrate) navigator.vibrate(10)
+        if (you) this.syncTouch(you)
       }
       return
     }
-    this.renderer.draw(this.attract, 1, { ...prefs, shake: 0 }, bias, '')
+    this.renderer.draw(this.attract, alpha, { ...prefs, shake: 0 }, bias, '')
   }
 
   private play(options: PlayOptions): void {
@@ -165,6 +207,7 @@ class App {
     this.finaleShown = false
     this.renderer.reset()
     this.input.reset()
+    this.resetStick()
     const config = buildMatchConfig(this.profile, tuned)
     this.session = new Session(config)
     this.screen = 'match'
@@ -276,20 +319,24 @@ class App {
     const taught = this.profile.taught
     const touch = window.matchMedia('(pointer: coarse)').matches
     const keys = touch
-      ? { steer: 'Drag the stick to steer', dash: 'DASH', ability: 'the ABILITY button', brake: 'BRAKE slows you' }
-      : { steer: 'WASD to steer', dash: 'Space', ability: 'F', brake: 'Shift brakes' }
+      ? { steer: 'Touch and drag anywhere on the left to steer', dash: 'Tap DASH to burst forward', ability: 'the ability button', brake: 'BRAKE slows you' }
+      : { steer: 'WASD to steer', dash: 'Space dashes', ability: 'F', brake: 'Shift brakes' }
     if (!taught.move && Math.hypot(you.vx, you.vy) < 40) return `${keys.steer}. You keep your speed when you let go.`
     if (!taught.move) taught.move = true
     if (!taught.land && you.stats.survival < 2) return 'Landings give a burst if you are holding a direction.'
     if (you.sinceLand < 0.05) taught.land = true
     if (!taught.speed && you.stats.maxSpeed < 360) return 'Speed is power. Build it, then commit to the hit.'
     if (you.stats.maxSpeed >= 360) taught.speed = true
-    if (!taught.dash && you.stats.dashes < 1) return `${keys.dash} dashes. Tap it as you land for a perfect dash.`
+    if (!taught.dash && you.stats.dashes < 1) return `${keys.dash}. Time it as you land for a perfect dash.`
     if (you.stats.dashes > 0) taught.dash = true
     if (!taught.ability && you.stats.abilityUses < 1) return `${abilityById(you.ability).name} is ${keys.ability}. It is a decision, not a stat.`
     if (you.stats.abilityUses > 0) taught.ability = true
     if (!taught.edge && you.edgeDist < 110) return `The edge is out. ${keys.brake}. Dash back toward the floor.`
     if (you.stats.escapes > 0) taught.edge = true
+    if (!taught.heat && you.heat >= 25) return 'Heat (the % by your name) rises with every hit you take. Hotter balls fly farther.'
+    if (you.heat >= 25 && you.stats.survival > 3) taught.heat = true
+    if (!taught.di && you.heat >= 60) return 'Getting launched? Steer sideways as you are hit to bend the launch away from the edge.'
+    if (you.heat >= 60 && you.stats.damageTaken > 1500) taught.di = true
     if (!taught.hit && you.stats.hits < 1) return 'A faster ball launches a slower one. Angle it toward the edge.'
     if (you.stats.hits > 0) taught.hit = true
     return ''
@@ -298,9 +345,11 @@ class App {
   private readFx(match: Match): void {
     const events = match.consumeFx()
     this.renderer.absorb(events, this.prefs(), this.youId, match)
+    const view = match.arena.view || 560
     for (const e of events) {
       const local = e.actorId === this.youId || e.victimId === this.youId
-      this.audio.fx(e, local)
+      this.audio.fx(e, local, clamp(e.x / view, -1, 1) * 0.7)
+      if (local && !match.silent && !this.highlight) this.feel(e)
       if (e.type === 'elim') {
         const victim = match.players.find((p) => p.id === e.victimId)
         this.lastElim = { x: e.x, y: e.y, color: victim?.color ?? e.color, time: match.time }
@@ -319,6 +368,81 @@ class App {
     }
   }
 
+  /** Haptics for things that happened to or by the local ball: phone vibration and pad rumble. */
+  private feel(e: { type: string; power: number; victimId: string }): void {
+    if (!this.profile.settings.haptics) return
+    const k = Math.min(1, e.power / 800)
+    let ms = 0
+    let strong = 0
+    let weak = 0
+    if (e.type === 'hit' && e.power > 160) {
+      ms = 25 + k * 70
+      strong = 0.2 + k * 0.7
+      weak = 0.35 + k * 0.4
+    } else if (e.type === 'elim') {
+      ms = e.victimId === this.youId ? 260 : 160
+      strong = 1
+      weak = 0.6
+    } else if (e.type === 'dash') {
+      ms = 18
+      weak = 0.35
+    } else if (e.type === 'boom') {
+      ms = 90
+      strong = 0.6
+      weak = 0.3
+    }
+    if (!ms) return
+    this.input.rumble(0, strong, weak, ms)
+    if (navigator.vibrate && window.matchMedia('(pointer: coarse)').matches) navigator.vibrate(Math.round(Math.min(ms, 60)))
+  }
+
+  /** Start pauses; in menus the stick and d-pad move focus, A presses, B goes back. */
+  private pollPad(): void {
+    const presses = this.input.padPresses(0)
+    if (presses.size === 0) return
+    this.audio.resume()
+    if (this.screen === 'match') {
+      if (presses.has('start')) {
+        this.togglePause()
+        return
+      }
+      if (!this.paused) return
+      if (presses.has('b')) {
+        this.togglePause()
+        return
+      }
+    }
+    if (this.highlight) return
+    const buttons = [...uiRoot.querySelectorAll<HTMLButtonElement>('button:not([disabled])')].filter((b) => b.offsetParent !== null)
+    if (!buttons.length) return
+    const current = document.activeElement instanceof HTMLButtonElement ? buttons.indexOf(document.activeElement) : -1
+    const move = (d: number) => {
+      const next = buttons[current < 0 ? 0 : (current + d + buttons.length) % buttons.length]!
+      next.focus()
+      next.scrollIntoView({ block: 'nearest' })
+      this.audio.hover()
+    }
+    if (presses.has('down') || presses.has('right')) move(1)
+    else if (presses.has('up') || presses.has('left')) move(-1)
+    if (presses.has('a')) (current >= 0 ? buttons[current]! : buttons[0]!).click()
+    if (presses.has('b')) uiRoot.querySelector<HTMLButtonElement>('button.back')?.click()
+    if (presses.has('start') && (this.screen === 'menu' || this.screen === 'play')) this.play(this.optionsFrom(this.shell.draft))
+    if (presses.has('start') && this.screen === 'results' && this.lastOptions) this.play(this.lastOptions)
+  }
+
+  /** Cooldown sweeps on the touch buttons. */
+  private syncTouch(you: Body): void {
+    if (!this.touch) return
+    const dash = you.dashCdMax <= 0 ? 1 : 1 - Math.min(1, you.dashCd / you.dashCdMax)
+    const ability = you.abilityCdMax <= 0 ? 1 : 1 - Math.min(1, you.abilityCd / you.abilityCdMax)
+    this.touch.dash.style.setProperty('--p', dash.toFixed(3))
+    this.touch.dash.classList.toggle('ready', you.dashCd <= 0)
+    this.touch.ability.style.setProperty('--p', ability.toFixed(3))
+    this.touch.ability.classList.toggle('ready', you.abilityCd <= 0)
+    const name = abilityById(you.ability).name.toUpperCase()
+    if (this.touch.ability.textContent !== name) this.touch.ability.textContent = name
+  }
+
   private prefs() {
     return {
       shake: this.profile.settings.shake,
@@ -326,6 +450,7 @@ class App {
       colorblind: this.profile.settings.colorblind,
       reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
       numbers: this.profile.settings.numbers,
+      flashes: this.profile.settings.flashes,
     }
   }
 
@@ -371,6 +496,10 @@ class App {
     this.shell.onTutorial = () => this.play({ modeId: 'tutorial', arenaId: 'classic', competitive: false, players: 2 })
     this.shell.onPractice = () => this.play({ modeId: 'practice', arenaId: this.shell.draft.arenaId, competitive: false, players: 4 })
     this.shell.onRanked = () => this.play({ modeId: 'duel', arenaId: 'classic', competitive: true, players: 2 })
+    this.shell.onTwist = () => {
+      const twist = dailyTwist()
+      this.play({ modeId: twist.modeId, arenaId: twist.arenaId, competitive: false, players: 0, mutators: twist.mutators })
+    }
     this.shell.onName = (name) => {
       this.profile.name = name
       saveProfile(this.profile)
@@ -432,53 +561,97 @@ class App {
 
   private applySettings(): void {
     document.documentElement.style.setProperty('--ui', String(this.profile.settings.uiScale))
+    this.input.deadzone = this.profile.settings.deadzone
     this.audio.setVolumes(this.profile.settings.volume, this.profile.settings.music)
   }
 
+  private touch: { dash: HTMLButtonElement; ability: HTMLButtonElement } | null = null
+  private resetStick: () => void = () => {}
+
+  /**
+   * Floating stick: a touch anywhere in the left zone plants the stick under the thumb, so the
+   * player never has to find a fixed circle. Buttons capture the pointer, so a thumb that slides
+   * a little off a button keeps it held.
+   */
   private bindTouch(): void {
+    const zone = document.querySelector('#stick-zone') as HTMLElement
     const stick = document.querySelector('#stick') as HTMLElement
     const knob = document.querySelector('#knob') as HTMLElement
     const dash = document.querySelector('#btn-dash') as HTMLButtonElement
     const ability = document.querySelector('#btn-ability') as HTMLButtonElement
     const brake = document.querySelector('#btn-brake') as HTMLButtonElement
+    this.touch = { dash, ability }
+    let owner = -1
+    let cx = 0
+    let cy = 0
+    const reach = 54
     const set = (e: PointerEvent) => {
-      const rect = stick.getBoundingClientRect()
-      const x = e.clientX - (rect.left + rect.width / 2)
-      const y = e.clientY - (rect.top + rect.height / 2)
-      const m = Math.hypot(x, y) || 1
-      const k = Math.min(1, m / (rect.width / 2))
-      this.input.stick.x = (x / m) * k
-      this.input.stick.y = (y / m) * k
+      const x = e.clientX - cx
+      const y = e.clientY - cy
+      const m = Math.hypot(x, y)
+      // 12% dead spot so a resting thumb does not drift.
+      const k = m < reach * 0.12 ? 0 : Math.min(1, m / reach)
+      this.input.stick.x = m > 0 ? (x / m) * k : 0
+      this.input.stick.y = m > 0 ? (y / m) * k : 0
       this.input.stick.active = true
       knob.style.transform = `translate(${this.input.stick.x * 36}px, ${this.input.stick.y * 36}px)`
     }
-    stick.addEventListener('pointerdown', (e) => {
-      stick.setPointerCapture(e.pointerId)
+    zone.addEventListener('pointerdown', (e) => {
+      if (owner !== -1) return
+      e.preventDefault()
+      owner = e.pointerId
+      zone.setPointerCapture(e.pointerId)
+      cx = e.clientX
+      cy = e.clientY
+      stick.style.left = `${cx - 66}px`
+      stick.style.top = `${cy - 66}px`
+      stick.style.bottom = 'auto'
+      stick.classList.add('live')
       set(e)
     })
-    stick.addEventListener('pointermove', (e) => {
-      if (this.input.stick.active) set(e)
+    zone.addEventListener('pointermove', (e) => {
+      if (e.pointerId === owner) set(e)
     })
-    const clear = () => {
+    const clear = (e: PointerEvent) => {
+      if (e.pointerId !== owner) return
+      owner = -1
       this.input.stick.active = false
       this.input.stick.x = 0
       this.input.stick.y = 0
       knob.style.transform = ''
+      stick.classList.remove('live')
+      stick.style.left = ''
+      stick.style.top = ''
+      stick.style.bottom = ''
     }
-    stick.addEventListener('pointerup', clear)
-    stick.addEventListener('pointercancel', clear)
+    zone.addEventListener('pointerup', clear)
+    zone.addEventListener('pointercancel', clear)
+    zone.addEventListener('lostpointercapture', clear)
+    this.resetStick = () => {
+      owner = -1
+      this.input.stick.active = false
+      this.input.stick.x = 0
+      this.input.stick.y = 0
+      knob.style.transform = ''
+      stick.classList.remove('live')
+      stick.style.left = ''
+      stick.style.top = ''
+      stick.style.bottom = ''
+    }
     const hold = (button: HTMLButtonElement, key: 'touchDash' | 'touchAbility' | 'touchBrake') => {
       const down = (e: PointerEvent) => {
         e.preventDefault()
+        button.setPointerCapture(e.pointerId)
         this.input[key] = true
+        if (this.profile.settings.haptics && navigator.vibrate) navigator.vibrate(8)
       }
       const up = () => {
         this.input[key] = false
       }
       button.addEventListener('pointerdown', down)
       button.addEventListener('pointerup', up)
-      button.addEventListener('pointerleave', up)
       button.addEventListener('pointercancel', up)
+      button.addEventListener('lostpointercapture', up)
     }
     hold(dash, 'touchDash')
     hold(ability, 'touchAbility')

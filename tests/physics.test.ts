@@ -26,6 +26,7 @@ function body(partial: Partial<ImpactBody>): ImpactBody {
     decoy: false,
     id: 'a',
     ownerId: '',
+    heat: 0,
     ...partial,
   }
 }

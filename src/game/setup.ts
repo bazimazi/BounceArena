@@ -10,6 +10,24 @@ export interface PlayOptions {
   players: number
   seed?: number
   localDuo?: boolean
+  /** Rule twists from the daily playlist. */
+  mutators?: string[]
+}
+
+/**
+ * Casual-only help, never in ranked. A player's first matches face soft bots (a new player should
+ * not be stomped), and a run of bottom-half finishes eases the bots a little. Only bot reaction and
+ * aim change. The physics stay the same for everyone.
+ */
+export function botEase(profile: Pick<Profile, 'matches' | 'recent'>, competitive: boolean, modeId: ModeId): number {
+  if (competitive || modeId === 'tutorial') return 1
+  const played = profile.matches ?? 0
+  if (played < 1) return 0.45
+  if (played < 3) return 0.62
+  if (played < 6) return 0.82
+  const recent = (profile.recent ?? []).filter((r) => !r.competitive).slice(0, 3)
+  if (recent.length === 3 && recent.every((r) => r.place > 2)) return 0.85
+  return 1
 }
 
 export function buildMatchConfig(profile: Profile, options: PlayOptions): MatchConfig {
@@ -25,14 +43,15 @@ export function buildMatchConfig(profile: Profile, options: PlayOptions): MatchC
   const humanColor = PALETTE[profile.color % PALETTE.length] ?? PALETTE[0]!
   players.push(makeHuman(profile, humanColor, mode.teams ? 0 : 0))
   const palette = PALETTE.filter((_, idx) => idx !== (profile.color % PALETTE.length))
+  const ease = botEase(profile, options.competitive && mode.ranked, options.modeId)
   for (let i = 1; i < count; i++) {
     const spread = 70 + i * 18
     const rating = clamp(profile.mmr + rng.range(-spread, spread), 820, 1750)
     const name = takeName(names, rng)
     const color = palette[(i - 1) % palette.length]!
     const team = mode.teams ? (i < Math.ceil(count / 2) ? 0 : 1) : i
-    const skill = clamp((rating - 850) / 950, 0.08, 0.95)
-    const aggression = options.modeId === 'tutorial' ? 0.28 : clamp(0.45 + skill * 0.4, 0.3, 0.95)
+    const skill = clamp(((rating - 850) / 950) * ease, 0.06, 0.95)
+    const aggression = options.modeId === 'tutorial' ? 0.28 : clamp((0.45 + skill * 0.4) * (0.55 + ease * 0.45), 0.25, 0.95)
     players.push({
       id: `bot-${i}`,
       name,
@@ -54,6 +73,7 @@ export function buildMatchConfig(profile: Profile, options: PlayOptions): MatchC
       emote: 'emote_nice',
       title: '',
       rating: Math.round(rating),
+      pace: ease < 1 ? 0.62 + ease * 0.38 : 1,
     })
   }
   if (options.localDuo && players[1]) {
@@ -89,6 +109,7 @@ export function buildMatchConfig(profile: Profile, options: PlayOptions): MatchC
     scoreLimit: mode.scoreLimit,
     players,
     recordReplay: true,
+    mutators: options.mutators?.length ? [...options.mutators] : [],
   }
 }
 
@@ -137,7 +158,9 @@ export function attractConfig(seed: number): MatchConfig {
       name: 'Scrim',
       color: 0,
       mmr: 1100,
-      matches: 0,
+      // A veteran profile so the menu backdrop shows bots at full skill.
+      matches: 50,
+      recent: [],
       loadout: { core: 'stable', shell: 'rubber', ability: 'shockwave', passive: 'none' },
       equipped: {
         trail: 'trail_comet',

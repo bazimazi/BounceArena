@@ -23,12 +23,24 @@ export interface ImpactBody {
   decoy: boolean
   id: string
   ownerId: string
+  /** Damage percent. Raises how far a strike launches this ball. */
+  heat: number
+  /** The victim's stick, read for launch steering. */
+  input?: { x: number; y: number }
+}
+
+/** Launch multiplier from heat: 1 at 0%, 1.8 at 100%. */
+export function heatMul(heat: number): number {
+  return 1 + (Math.max(0, heat) / 100) * TUNE.heatScale
 }
 
 export interface ImpactOutcome {
   kind: 'none' | 'phase' | 'separate' | 'trade' | 'strike' | 'anchor' | 'mirror' | 'pop'
   attacker: -1 | 0 | 1
+  /** Launch power actually applied, heat included. */
   power: number
+  /** The hit's own power before the victim's heat, for stats, numbers, and heat gain. */
+  base?: number
   popA: boolean
   popB: boolean
 }
@@ -158,9 +170,11 @@ function strike(
   power *= 0.9 + 0.22 * striker.momentum
   if (striker.dashTime > 0) power *= TUNE.dashStrikeMul
   if (striker.overdriveTime > 0) power *= 1.1
-  power = clamp(power, 0, SPEED_CAP)
+  const base = clamp(power, 0, SPEED_CAP)
 
   if (victim.mirrorTime > 0 && !victim.decoy) {
+    // The reflection lands on the striker, so it is the striker's heat that scales it.
+    power = clamp(base * heatMul(striker.heat), 0, SPEED_CAP)
     victim.mirrorTime = 0
     const keep = 0.15
     striker.vx = striker.vx * keep - kx * power
@@ -173,21 +187,35 @@ function strike(
       kind: 'mirror',
       attacker: attackerIndex === 0 ? 1 : 0,
       power,
+      base,
       popA: attackerIndex === 0 ? popStriker : popVictim,
       popB: attackerIndex === 0 ? popVictim : popStriker,
     }
   }
 
+  power = victim.decoy ? base : clamp(base * heatMul(victim.heat), 0, SPEED_CAP)
+
+  // Launch steering: the victim's stick bends the launch a few degrees, like DI.
+  let lx = kx
+  let ly = ky
+  if (victim.input && !victim.decoy) {
+    const side = clamp(victim.input.x * -ky + victim.input.y * kx, -1, 1)
+    const turn = side * TUNE.diAngle
+    const c = Math.cos(turn)
+    const s = Math.sin(turn)
+    lx = kx * c - ky * s
+    ly = kx * s + ky * c
+  }
   const retain = striker.dashTime > 0 ? TUNE.dashRetain : TUNE.strikeRetain
-  victim.vx = victim.vx * 0.12 + kx * power
-  victim.vy = victim.vy * 0.12 + ky * power
+  victim.vx = victim.vx * 0.12 + lx * power
+  victim.vy = victim.vy * 0.12 + ly * power
   striker.vx *= retain
   striker.vy *= retain
   capSpeed(striker)
   capSpeed(victim)
   const popA = attackerIndex === 0 ? popStriker : popVictim
   const popB = attackerIndex === 0 ? popVictim : popStriker
-  return { kind: 'strike', attacker: attackerIndex, power, popA, popB }
+  return { kind: 'strike', attacker: attackerIndex, power, base, popA, popB }
 }
 
 function bounceOffAnchor(mover: ImpactBody, anchor: ImpactBody, nx: number, ny: number, moverIndex: 0 | 1): ImpactOutcome {

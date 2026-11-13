@@ -30,6 +30,10 @@ export interface Body {
   vy: number
   prevX: number
   prevY: number
+  /** Bounce height and fall depth at the start of the tick, for render interpolation. */
+  prevH: number
+  /** Damage percent. Each hit raises it, and a hotter ball launches farther. Resets every stock. */
+  heat: number
   radius: number
   mass: number
   restitution: number
@@ -118,6 +122,12 @@ export interface Body {
   botDash: boolean
   botAbility: boolean
   botBrake: boolean
+  /** Who this bot is lining up, so bots spread their attention instead of ganging one ball. */
+  botTarget: string
+  /** Seconds the current target has been tracked. Commitments wait for a human reaction time. */
+  botLock: number
+  /** A soft-lobby bot: gives humans a warm-up window before hunting them. */
+  soft: boolean
 
   decoy: boolean
   ownerId: string
@@ -128,12 +138,14 @@ export interface Body {
   histI: number
 }
 
-export function createBody(cfg: PlayerConfig, stocks: number, competitive: boolean): Body {
+export function createBody(cfg: PlayerConfig, stocks: number, competitive: boolean, mutators: readonly string[] = []): Body {
   const core = coreById(competitive ? 'stable' : cfg.core)
   const shell = shellById(competitive ? 'rubber' : cfg.shell)
   const passive = competitive ? 'none' : cfg.passive
   const ability = abilityById(cfg.ability)
-  const radius = core.radius
+  const has = (m: string) => mutators.includes(m)
+  const radius = core.radius * (has('giant') ? 1.4 : 1)
+  const pace = cfg.bot ? Math.max(0.6, Math.min(1, cfg.pace ?? 1)) : 1
   return {
     id: cfg.id,
     name: cfg.name,
@@ -162,16 +174,18 @@ export function createBody(cfg: PlayerConfig, stocks: number, competitive: boole
     vy: 0,
     prevX: 0,
     prevY: 0,
+    prevH: 0,
+    heat: 0,
     radius,
-    mass: core.mass * shell.mass,
+    mass: core.mass * shell.mass * (has('giant') ? 1.15 : 1),
     restitution: core.restitution * shell.restitution,
-    accel: TUNE.accel * core.accel,
-    maxSpeed: TUNE.maxSpeed * core.maxSpeed,
+    accel: TUNE.accel * core.accel * (has('hyper') ? 1.3 : 1) * pace,
+    maxSpeed: TUNE.maxSpeed * core.maxSpeed * (has('hyper') ? 1.18 : 1) * (0.5 + pace * 0.5),
     turnRate: core.turn,
     outgoing: core.outgoing * shell.outgoing * (passive === 'heavy-hitter' ? 1.1 : 1),
-    incoming: core.incoming * shell.incoming,
+    incoming: core.incoming * shell.incoming * (has('glass') ? 1.3 : 1),
     dashMul: core.dash,
-    dashCdMax: TUNE.dashCooldown * core.dashCd * shell.dashCd,
+    dashCdMax: TUNE.dashCooldown * core.dashCd * shell.dashCd * (has('frenzy') ? 0.45 : 1),
     period: TUNE.bouncePeriod * shell.period,
     bounceAmp: TUNE.bounceAmp,
     landMul: shell.land,
@@ -189,7 +203,7 @@ export function createBody(cfg: PlayerConfig, stocks: number, competitive: boole
     dashTime: 0,
     perfectFlash: 0,
     abilityCd: 0,
-    abilityCdMax: ability.cooldown,
+    abilityCdMax: ability.cooldown * (has('frenzy') ? 0.55 : 1),
     phaseTime: 0,
     anchorTime: 0,
     overdriveTime: 0,
@@ -245,6 +259,9 @@ export function createBody(cfg: PlayerConfig, stocks: number, competitive: boole
     botDash: false,
     botAbility: false,
     botBrake: false,
+    botTarget: '',
+    botLock: 0,
+    soft: pace < 1,
     decoy: false,
     ownerId: '',
     decoyLife: 0,

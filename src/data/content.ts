@@ -497,7 +497,85 @@ export const ARENAS: ArenaDef[] = [
     shrinkRate: 0,
     shrinkDelay: 0,
   },
+  {
+    id: 'turbine',
+    name: 'Turbine',
+    tagline: 'Spinning blades',
+    blurb: 'Two blades sweep the floor. Ride one into a hit, or get swept off the rim.',
+    floor: '#161c2e',
+    rim: '#d6ff4a',
+    accent: '#4cc9ff',
+    view: 560,
+    solids: [circle('floor', 0, 0, 450, 'normal')],
+    walls: [
+      { x1: 70, y1: 0, x2: 270, y2: 0, restitution: 1.1, spin: 0.62, lethal: false },
+      { x1: -70, y1: 0, x2: -270, y2: 0, restitution: 1.1, spin: 0.62, lethal: false },
+    ],
+    hazards: [],
+    spawns: spawns(8, 340, -Math.PI / 2 + 0.2),
+    final: 'shrink',
+    shrinkRate: 0,
+    shrinkDelay: 0,
+  },
 ]
+
+export interface MutatorDef {
+  id: string
+  name: string
+  blurb: string
+  color: string
+}
+
+/** Rule twists for the daily playlist. The sim reads them by id. */
+export const MUTATORS: MutatorDef[] = [
+  { id: 'lowgrav', name: 'Low Gravity', blurb: 'Big hang time. Every save takes longer.', color: '#7ee0ff' },
+  { id: 'giant', name: 'Giants', blurb: 'Huge, heavy balls on the same floor. Nowhere to hide.', color: '#ff9f3a' },
+  { id: 'hyper', name: 'Hyper Speed', blurb: 'Higher top speed, faster pickup. Hits arrive sooner.', color: '#ff4d3a' },
+  { id: 'frenzy', name: 'Dash Frenzy', blurb: 'Dash and ability cooldowns cut in half.', color: '#ffc14d' },
+  { id: 'glass', name: 'Glass Cannons', blurb: 'Everyone takes 30% more launch.', color: '#ff6b9a' },
+  { id: 'ice', name: 'Black Ice', blurb: 'The whole floor is slick. Plan your stops.', color: '#b8f2ff' },
+  { id: 'overheat', name: 'Overheat', blurb: 'Heat builds almost twice as fast.', color: '#ff6a2a' },
+]
+
+export function mutatorById(id: string): MutatorDef | undefined {
+  return MUTATORS.find((m) => m.id === id)
+}
+
+export interface TwistDef {
+  key: string
+  modeId: ModeId
+  arenaId: string
+  mutators: string[]
+  name: string
+  blurb: string
+}
+
+const TWIST_MODES: ModeId[] = ['ffa', 'chaos', 'king', 'score', 'team', 'ffa', 'survivor']
+
+/** Today's featured playlist: one mode and two mutators, the same for everyone on that date. */
+export function dailyTwist(now = new Date()): TwistDef {
+  const key = dateKey(now)
+  let h = 2166136261
+  for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 16777619) >>> 0
+  const pick = (n: number, salt: number) => (Math.imul(h ^ salt, 2654435761) >>> 0) % n
+  const modeId = TWIST_MODES[pick(TWIST_MODES.length, 11)]!
+  const first = MUTATORS[pick(MUTATORS.length, 23)]!
+  const rest = MUTATORS.filter((m) => m.id !== first.id)
+  const second = rest[pick(rest.length, 37)]!
+  // Low gravity on ice is unplayable on small floors; swap the second pick (either order).
+  const clash = (a: string, b: string) => (a === 'ice' && b === 'lowgrav') || (a === 'lowgrav' && b === 'ice')
+  const pair = [first, clash(first.id, second.id) ? rest[(pick(rest.length, 37) + 1) % rest.length]! : second]
+  const arenaPool = ARENAS.filter((a) => modeId !== 'king' || a.solids.length === 1)
+  const arena = arenaPool[pick(arenaPool.length, 51)]!
+  return {
+    key,
+    modeId,
+    arenaId: arena.id,
+    mutators: pair.map((m) => m.id),
+    name: pair.map((m) => m.name).join(' + '),
+    blurb: `${modeById(modeId).name} on ${arena.name}. ${pair[0]!.blurb}`,
+  }
+}
 
 /** Team 0 and team 1 markers in team modes. */
 export const TEAM_COLORS = ['#4cc9ff', '#ff9f3a']

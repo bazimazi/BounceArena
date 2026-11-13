@@ -38,8 +38,11 @@ export function thinkBot(body: Body, sense: BotSense): void {
   }
 
   body.botReact -= DT
+  body.botLock += DT
   if (body.botReact <= 0) {
-    body.botReact = lerp(0.28, 0.05, body.skill)
+    // Steering re-aims often so tracking stays smooth, with jitter so the rhythm never reads as a
+    // metronome. Commitments (dash, ability) wait for a human reaction time instead; see decide().
+    body.botReact = lerp(0.24, 0.06, body.skill) + hashSigned(sense.playTick, body.id, 13) * 0.02
     decide(body, sense)
   }
   body.input = {
@@ -71,7 +74,8 @@ function repel(body: Body, sense: BotSense): { x: number; y: number } {
 
 function edgeEmergency(body: Body, tick: number): InputFrame | null {
   const speed = hypot(body.vx, body.vy)
-  const warn = 64 + speed * 0.28
+  // A hot ball plays the edge more carefully: one more hit sends it farther.
+  const warn = 64 + speed * 0.28 + Math.min(60, body.heat * 0.3)
   const outward = body.vx * -body.safetyX + body.vy * -body.safetyY
   if (body.edgeDist > warn || outward < 28) return null
   const panic = body.edgeDist < 26 + speed * 0.07
@@ -109,7 +113,11 @@ function decide(body: Body, sense: BotSense): void {
   const decoys = foes.filter((o) => o.decoy && o.ownerId !== body.id)
   let pool = real
   if (decoys.length > 0 && body.skill < 0.7 && hash01(sense.playTick, body.id, 3) < 0.5) pool = decoys
-  const target = pickTarget(body, pool.length ? pool : real)
+  const target = pickTarget(body, pool.length ? pool : real, sense.bodies, sense.time)
+  if ((target?.id ?? '') !== body.botTarget) body.botLock = 0
+  body.botTarget = target?.id ?? ''
+  // Human-range reaction: ~420 ms for a rookie down to ~180 ms for a champion before committing.
+  const reacted = body.botLock >= lerp(0.42, 0.18, body.skill) + hash01(sense.playTick, body.id, 14) * 0.06
   const speed = hypot(body.vx, body.vy)
   const buildBelow = lerp(300, 150, body.aggression)
 
@@ -147,8 +155,10 @@ function decide(body: Body, sense: BotSense): void {
   const lead = clamp(dist / (speed + 90), 0, 0.5) * lerp(0.15, 0.9, body.skill)
   let ax = target.x + target.vx * lead - body.x
   let ay = target.y + target.vy * lead - body.y
-  ax += hashSigned(sense.playTick, body.id, 1) * (1 - body.skill) * 90
-  ay += hashSigned(sense.playTick, body.id, 2) * (1 - body.skill) * 90
+  // Aim error shrinks with skill but never reaches zero.
+  const wobble = (1 - body.skill * 0.85) * 90
+  ax += hashSigned(sense.playTick, body.id, 1) * wobble
+  ay += hashSigned(sense.playTick, body.id, 2) * wobble
   const away = hypot(target.x, target.y) || 1
   ax += (target.x / away) * 150
   ay += (target.y / away) * 150
@@ -168,6 +178,7 @@ function decide(body: Body, sense: BotSense): void {
   const align = steerAlign(body.vx, body.vy, aimed.x, aimed.y)
   const outwardDash = body.edgeDist < 120 && aimed.x * body.safetyX + aimed.y * body.safetyY < 0.15
   if (
+    reacted &&
     body.dashCd <= 0 &&
     !outwardDash &&
     align > 0.72 &&
@@ -183,16 +194,19 @@ function decide(body: Body, sense: BotSense): void {
   if (speed > 520 && align < -0.15) body.botBrake = true
 
   const incoming = incomingThreat(body, real)
-  if (body.abilityCd <= 0 && wantAbility(body, target, dist, incoming, real, sense)) {
+  if (body.abilityCd <= 0 && (reacted || !!incoming) && wantAbility(body, target, dist, incoming, real, sense)) {
     body.botAbility = hash01(sense.playTick, body.id, 7) < 0.55 + body.skill * 0.4
   }
 }
 
-function pickTarget(body: Body, pool: Body[]): Body | null {
+function pickTarget(body: Body, pool: Body[], everyone: Body[], time: number): Body | null {
   let best: Body | null = null
   let bestScore = -Infinity
   const speed = hypot(body.vx, body.vy)
   for (const f of pool) {
+    // Other bots already lining this ball up. Spreading out reads as a real lobby, not a pile-on.
+    let hunters = 0
+    for (const o of everyone) if (o !== body && o.bot && o.alive && o.botTarget === f.id) hunters++
     if (!f.alive) continue
     const dx = f.x - body.x
     const dy = f.y - body.y
@@ -200,6 +214,10 @@ function pickTarget(body: Body, pool: Body[]): Body | null {
     const align = speed > 40 ? (body.vx * dx + body.vy * dy) / (speed * d) : 0
     const edge = clamp(1 - f.edgeDist / 150, 0, 1.2)
     let score = edge * 2.1 + align * 1.3 + (1 - Math.min(d, 640) / 640) * 1.15
+    score += clamp(f.heat / 120, 0, 1.4) * 0.9
+    score -= hunters * 0.5
+    if (f.id === body.botTarget) score += 0.35
+    if (body.soft && !f.bot && time < 12) score -= 2.6
     if (f.invuln > 0) score -= 1.6
     if (f.anchorTime > 0) score -= 1.2
     score *= 0.55 + body.aggression

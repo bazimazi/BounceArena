@@ -40,6 +40,7 @@ function placement(partial: Partial<Placement> = {}): Placement {
     longestLife: 20,
     firstElimAt: 12,
     behindAtMid: false,
+    peakHeat: 0,
     won: true,
     ...partial,
   }

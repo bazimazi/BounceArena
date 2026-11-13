@@ -78,6 +78,8 @@ export interface PlayerConfig {
   emote: string
   title: string
   rating: number
+  /** Bot-only speed handicap for soft casual lobbies. 1 = full pace. */
+  pace?: number
 }
 
 export interface MatchConfig {
@@ -99,6 +101,8 @@ export interface MatchConfig {
   scoreLimit: number
   players: PlayerConfig[]
   recordReplay: boolean
+  /** Rule twists, e.g. low gravity or giant balls. See MUTATORS in content. */
+  mutators?: string[]
 }
 
 export interface BodyStats {
@@ -129,6 +133,8 @@ export interface BodyStats {
   /** Play time of the first credited knockout, 0 if none. */
   firstElimAt: number
   behindAtMid: boolean
+  /** Highest heat this ball survived to. */
+  peakHeat: number
 }
 
 export interface Moment {
@@ -228,6 +234,7 @@ export interface Placement {
   longestLife: number
   firstElimAt: number
   behindAtMid: boolean
+  peakHeat: number
   won: boolean
 }
 
@@ -259,6 +266,7 @@ export function emptyStats(): BodyStats {
     hits: 0,
     firstElimAt: 0,
     behindAtMid: false,
+    peakHeat: 0,
   }
 }
 

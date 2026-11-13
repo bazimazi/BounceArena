@@ -8,6 +8,12 @@ export interface Settings {
   uiScale: number
   colorblind: boolean
   numbers: boolean
+  /** Full-screen flashes on big hits and knockouts. */
+  flashes: boolean
+  /** Gamepad stick deadzone, 0.05..0.35. */
+  deadzone: number
+  /** Game speed in Practice and the Tutorial, 0.5..1. An assist, never used in scored matches. */
+  practiceSpeed: number
 }
 
 export interface CareerStats {
@@ -256,6 +262,9 @@ export function defaultProfile(): Profile {
       uiScale: 1,
       colorblind: false,
       numbers: true,
+      flashes: true,
+      deadzone: 0.15,
+      practiceSpeed: 1,
     },
     taught: {},
     matches: 0,
