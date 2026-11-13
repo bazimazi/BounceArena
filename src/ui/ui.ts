@@ -7,6 +7,7 @@ import {
   OVERTIME_XP,
   RANK_TIERS,
   SWEEP_BONUS,
+  TEAM_COLORS,
   arenaById,
   cosmeticById,
   dateKey,
@@ -17,13 +18,14 @@ import {
   modeById,
   rankName,
   rankTierIndex,
+  seasonBounds,
   type ArenaDef,
   type CosmeticDef,
 } from '../data/content'
 import { abilityById } from '../data/tuning'
 import type { MatchResult } from '../core/types'
 import { xpIntoLevel, type Profile } from '../progression/profile'
-import { achievementProgress, canReroll, challengeDef, liveDayStreak, type Grant, type SettleOutcome } from '../progression/settle'
+import { achievementProgress, canReroll, challengeDef, isPodium, liveDayStreak, type Grant, type SettleOutcome } from '../progression/settle'
 import { solidPose } from '../sim/geometry'
 import type { FeedItem, Banner, Match } from '../sim/match'
 import type { PlayOptions } from '../game/setup'
@@ -140,8 +142,9 @@ export class Shell {
   constructor(private root: HTMLElement, private hud: HTMLElement) {
     window.addEventListener('keydown', (e) => {
       if (e.code !== 'Enter' || e.repeat) return
-      const typing = document.activeElement instanceof HTMLInputElement && document.activeElement.type === 'text'
-      if (typing) return
+      // Enter on a focused control activates that control, not the queue.
+      const focused = document.activeElement
+      if (focused instanceof HTMLInputElement || focused instanceof HTMLButtonElement || focused instanceof HTMLSelectElement || focused instanceof HTMLTextAreaElement) return
       if (this.current === 'menu') this.onPlay(this.draft)
       else if (this.current === 'play') this.onPlay({ ...this.draft })
       else if (this.current === 'results') this.rematchKey?.()
@@ -188,9 +191,16 @@ export class Shell {
     name.value = profile.name
     name.maxLength = 16
     name.ariaLabel = 'Player name'
-    name.addEventListener('change', () => this.onName(name.value.trim().slice(0, 16) || 'Player'))
+    name.addEventListener('change', () => {
+      const clean = name.value.trim().slice(0, 16) || 'Player'
+      name.value = clean
+      this.onName(clean)
+    })
     name.addEventListener('keydown', (e) => {
-      if (e.code === 'Enter') name.blur()
+      if (e.code !== 'Enter' && e.code !== 'NumpadEnter') return
+      // Confirm the name only; do not let the menu's Enter shortcut start a match.
+      e.stopPropagation()
+      name.blur()
     })
     nameRow.append(el('span', '', 'Name'), name)
     panel.append(play, ranked, row, nav, nameRow)
@@ -413,8 +423,7 @@ export class Shell {
     const season = displaySeason()
     const live = season.id === profile.seasonId
     const now = Date.now()
-    const start = Date.parse(season.start)
-    const end = Date.parse(season.end) + 86400000
+    const { start, end } = seasonBounds(season)
     const days = Math.max(0, Math.ceil(((now < start ? start : end) - now) / 86400000))
     const when = now < start ? `Starts in ${days} day${days === 1 ? '' : 's'}` : `${days} day${days === 1 ? '' : 's'} left`
     const head = el('div', 'season-head')
@@ -527,7 +536,7 @@ export class Shell {
     panel.append(el('div', 'section', 'Video'))
     panel.append(slider('Screen shake', profile.settings.shake, (v) => this.onSettings({ shake: v })))
     const uiT = Math.max(0, Math.min(1, (profile.settings.uiScale - 0.85) / 0.4))
-    panel.append(slider('UI scale', uiT, (v) => this.onSettings({ uiScale: 0.85 + v * 0.4 })))
+    panel.append(slider('UI scale', uiT, (v) => this.onSettings({ uiScale: 0.85 + v * 0.4 }), (v) => `${Math.round((0.85 + v * 0.4) * 100)}%`))
     panel.append(toggle('Reduced effects', 'Fewer particles, no impact frames', profile.settings.fx === 'reduced', (v) => this.onSettings({ fx: v ? 'reduced' : 'full' })))
     panel.append(toggle('Stronger patterns', 'Extra marks on every ball', profile.settings.colorblind, (v) => this.onSettings({ colorblind: v })))
     panel.append(toggle('Speed numbers', 'Show hit power', profile.settings.numbers, (v) => this.onSettings({ numbers: v })))
@@ -562,11 +571,12 @@ export class Shell {
     const you = result.placements.find((p) => p.id === result.youId)
     const place = you?.place ?? 1
     const won = !!you?.won || place === 1
-    const tone = won ? '#ffc14d' : place <= 3 ? '#7ee0ff' : '#ff4d3a'
+    const podium = isPodium(place, result.placements.length)
+    const tone = won ? '#ffc14d' : podium ? '#7ee0ff' : '#ff4d3a'
     card.style.setProperty('--tone', tone)
 
     const head = el('div', 'res-head')
-    head.append(el('div', 'res-kicker', won ? 'VICTORY' : result.forfeit && place === result.placements.length ? 'FORFEIT' : place <= 3 ? 'PODIUM' : 'KNOCKED OUT'))
+    head.append(el('div', 'res-kicker', won ? 'VICTORY' : result.forfeit && place === result.placements.length ? 'FORFEIT' : podium ? 'PODIUM' : result.competitive || result.placements.length <= 2 ? 'DEFEAT' : 'KNOCKED OUT'))
     const placeEl = el('div', 'place', placeLabel(place))
     head.append(placeEl, el('div', 'res-name', `${you?.name ?? profile.name} · ${result.competitive ? 'Ranked' : 'Casual'}`))
     card.append(head)
@@ -601,7 +611,7 @@ export class Shell {
 
     const board = el('div', 'board')
     for (const p of [...result.placements].sort((a, b) => a.place - b.place)) {
-      const row = el('div', `slot${p.id === result.youId ? ' on' : ''}${p.place <= 3 ? ` medal m${p.place}` : ''}`)
+      const row = el('div', `slot${p.id === result.youId ? ' on' : ''}${isPodium(p.place, result.placements.length) || p.place === 1 ? ` medal m${p.place}` : ''}`)
       const sw = el('i', 'swatch')
       sw.style.setProperty('--c', p.color)
       row.append(el('b', 'pos', String(p.place)), sw, el('span', '', p.name), el('small', '', `${p.elims} KO`))
@@ -684,7 +694,7 @@ export class Shell {
     sheet.append(resume)
     sheet.append(button('End match', 'ghost', () => this.onForfeit()))
     sheet.append(button('Menu', 'ghost', () => this.onMenu()))
-    sheet.append(el('p', 'lede', 'WASD steer · Space dash · F ability · Shift brake · G emote'))
+    if (!window.matchMedia('(pointer: coarse)').matches) sheet.append(el('p', 'lede', 'WASD steer · Space dash · F ability · Shift brake · G emote'))
     overlay.append(sheet)
     this.root.append(overlay)
   }
@@ -766,18 +776,31 @@ export class Shell {
     r.timer.classList.toggle('urgent', secs <= 10 || match.status === 'sudden')
 
     // Roster: rebuild only when something visible changes.
-    const rows = [...match.players].sort((a, b) => (a.eliminated ? 1 : 0) - (b.eliminated ? 1 : 0) || a.placement - b.placement || b.stats.score - a.stats.score || b.stocks - a.stocks)
-    const key = rows.map((p) => `${p.id}:${p.stocks}:${p.eliminated ? p.placement : ''}:${p.alive ? 1 : 0}`).join('|')
+    const teams = match.config.teams
+    const points = match.config.win === 'score'
+    const rows = [...match.players].sort((a, b) => (teams ? a.team - b.team : 0) || (a.eliminated ? 1 : 0) - (b.eliminated ? 1 : 0) || a.placement - b.placement || b.stats.score - a.stats.score || b.stocks - a.stocks)
+    const key = rows.map((p) => `${p.id}:${p.stocks}:${p.eliminated ? p.placement : ''}:${p.alive ? 1 : 0}:${points ? Math.floor(p.stats.score) : ''}`).join('|')
     if (key !== this.rosterKey) {
       this.rosterKey = key
       r.roster.replaceChildren()
       for (const p of rows) {
-        const slot = el('div', `slot${p.id === you.id ? ' on' : ''}${p.eliminated ? ' out' : ''}${!p.alive && !p.eliminated ? ' down' : ''}`)
+        const slot = el('div', `slot${p.id === you.id ? ' on' : ''}${p.eliminated ? ' out' : ''}${!p.alive && !p.eliminated ? ' down' : ''}${teams ? ` team${p.id !== you.id && p.team === you.team ? ' ally' : ''}` : ''}`)
+        if (teams) slot.style.setProperty('--team', TEAM_COLORS[p.team % TEAM_COLORS.length]!)
         const sw = el('i', 'swatch')
         sw.style.setProperty('--c', p.color)
         const pips = el('span', 'pips')
         if (p.eliminated) pips.textContent = `#${p.placement}`
-        else if (match.config.respawn === 'always') pips.textContent = String(p.stats.elims)
+        else if (points) {
+          // Score modes are won on points, so show them.
+          pips.append(el('b', 'pts', String(Math.floor(p.stats.score))))
+          if (match.config.respawn === 'stocks') {
+            for (let i = 0; i < Math.min(5, p.stocks); i++) {
+              const pip = el('i')
+              pip.style.setProperty('--c', p.color)
+              pips.append(pip)
+            }
+          }
+        } else if (match.config.respawn === 'always') pips.textContent = String(p.stats.elims)
         else {
           for (let i = 0; i < Math.min(5, p.stocks); i++) {
             const pip = el('i')
@@ -1202,9 +1225,9 @@ function toggle(label: string, sub: string, value: boolean, onChange: (v: boolea
   return row
 }
 
-function slider(label: string, value: number, onChange: (v: number) => void): HTMLElement {
+function slider(label: string, value: number, onChange: (v: number) => void, format: (v: number) => string = (v) => String(Math.round(v * 100))): HTMLElement {
   const wrap = el('label', 'slider')
-  const num = el('b', '', String(Math.round(value * 100)))
+  const num = el('b', '', format(value))
   const head = el('span', '')
   head.append(document.createTextNode(`${label} `), num)
   const input = document.createElement('input')
@@ -1216,7 +1239,7 @@ function slider(label: string, value: number, onChange: (v: number) => void): HT
   input.style.setProperty('--fill', `${value * 100}%`)
   input.addEventListener('input', () => {
     const v = Number(input.value)
-    num.textContent = String(Math.round(v * 100))
+    num.textContent = format(v)
     input.style.setProperty('--fill', `${v * 100}%`)
     onChange(v)
   })

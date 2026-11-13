@@ -33,7 +33,10 @@ body[data-mode="match"] #scrim { opacity: 0; }
 body[data-mode="results"] #scrim { background: radial-gradient(ellipse at center, rgba(4,8,12,0.35), rgba(4,8,12,0.8)); }
 
 #ui, #hud, #touch { position: fixed; inset: 0; pointer-events: none; }
-#ui > *, #hud > *, #touch > * { pointer-events: auto; }
+/* HUD readouts stay click-through so they never block the canvas or the pause sheet; only the pause button takes input. */
+#ui > *, #touch > *, #hud > .pause { pointer-events: auto; }
+/* The pause sheet and results live in #ui and must sit above the HUD and touch controls. */
+#ui { z-index: 10; }
 .hidden { display: none !important; }
 .phase[hidden], .hint[hidden], .spectate[hidden] { display: none; }
 
@@ -371,6 +374,9 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 .slot { display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: center; font-size: 13px; color: var(--dim); padding: 3px 6px; border-radius: 6px; font-weight: 600; }
 .slot.on { color: #fff; background: rgba(255,255,255,0.08); }
 .slot.out { opacity: 0.4; }
+.slot.team { box-shadow: inset 3px 0 0 var(--team); }
+.slot.team.ally .nm::after { content: ' · ALLY'; color: var(--team); font-size: 10px; letter-spacing: 0.06em; }
+.pips .pts { font-family: var(--display); font-size: 14px; color: #fff; margin-right: 4px; min-width: 2ch; text-align: right; }
 .slot.out .nm { text-decoration: line-through; }
 .slot.down .swatch { animation: blink 0.4s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0.2; } }
@@ -546,6 +552,10 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
   body[data-mode="match"] #touch { display: block; }
   body[data-mode="match"] .hud-bottom { bottom: 12px; gap: 8px; }
   body[data-mode="match"] .cd { display: none; }
+  /* One column on the right so the buttons never cover the centre speed gauge. */
+  .touch-actions { flex-direction: column; align-items: center; }
+  #btn-brake { right: 27px; bottom: 214px; }
+  body[data-mode="match"] .hint { bottom: 176px; }
 }
 @media (max-width: 800px) {
   .panel, .panel.wide { width: 100%; background: rgba(4,7,12,0.9); }

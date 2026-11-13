@@ -499,6 +499,9 @@ export const ARENAS: ArenaDef[] = [
   },
 ]
 
+/** Team 0 and team 1 markers in team modes. */
+export const TEAM_COLORS = ['#4cc9ff', '#ff9f3a']
+
 export const MODES: ModeDef[] = [
   {
     id: 'ffa',
@@ -945,11 +948,18 @@ export function rankName(rating: number): { tier: string; division: number; labe
   return { tier: tier.name, division, label: `${tier.name}${divLabel}` }
 }
 
+/** Local-time bounds of a season, matching the local day and week keys. The end date runs through its last day. */
+export function seasonBounds(season: SeasonDef): { start: number; end: number } {
+  const [sy, sm, sd] = season.start.split('-').map(Number) as [number, number, number]
+  const [ey, em, ed] = season.end.split('-').map(Number) as [number, number, number]
+  return { start: new Date(sy, sm - 1, sd).getTime(), end: new Date(ey, em - 1, ed + 1).getTime() }
+}
+
 export function currentSeason(now = new Date()): SeasonDef | null {
   const t = now.getTime()
   for (const season of SEASONS) {
-    // The end date runs through its last day.
-    if (t >= Date.parse(season.start) && t < Date.parse(season.end) + 86400000) return season
+    const { start, end } = seasonBounds(season)
+    if (t >= start && t < end) return season
   }
   return null
 }
@@ -961,7 +971,7 @@ export function seasonById(id: string): SeasonDef | undefined {
 /** The running season, else the next one, else the last one. */
 export function displaySeason(now = new Date()): SeasonDef {
   const t = now.getTime()
-  return currentSeason(now) ?? SEASONS.find((s) => Date.parse(s.start) > t) ?? SEASONS[SEASONS.length - 1]!
+  return currentSeason(now) ?? SEASONS.find((s) => seasonBounds(s).start > t) ?? SEASONS[SEASONS.length - 1]!
 }
 
 export function rankTierIndex(rating: number): number {

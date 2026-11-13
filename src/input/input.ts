@@ -23,7 +23,9 @@ export class Input {
   attach(target: HTMLElement): void {
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Escape') this.onPause?.()
-      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault()
+      // Only in a match: menus keep Space to press buttons and arrows to scroll.
+      const playing = document.body.dataset.mode === 'match'
+      if (playing && ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault()
       this.keys.add(e.code)
     })
     window.addEventListener('keyup', (e) => this.keys.delete(e.code))
@@ -53,10 +55,12 @@ export class Input {
     this.touchBrake = false
   }
 
-  player(worldX: number, worldY: number, screenOf: (x: number, y: number) => { x: number; y: number }, mouseSteer: boolean): InputFrame {
+  /** `arrows` lets a solo player steer with the arrow keys too; local duo gives them to player 2. */
+  player(worldX: number, worldY: number, screenOf: (x: number, y: number) => { x: number; y: number }, mouseSteer: boolean, arrows = false): InputFrame {
     let x = 0
     let y = 0
-    for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
+    const codes = arrows ? Object.keys(P1_MOVE) : ['KeyW', 'KeyA', 'KeyS', 'KeyD']
+    for (const code of codes) {
       if (!this.keys.has(code)) continue
       const d = P1_MOVE[code]!
       x += d[0]
@@ -116,14 +120,16 @@ export class Input {
         y += ay
       }
     }
-    if (!any && !pad) return null
-    return {
+    const frame = {
       x,
       y,
-      dash: this.keys.has('Enter') || !!pad?.buttons[0]?.pressed,
+      dash: this.keys.has('Enter') || this.keys.has('NumpadEnter') || !!pad?.buttons[0]?.pressed,
       ability: this.keys.has('ControlRight') || !!pad?.buttons[1]?.pressed,
       brake: this.keys.has('ShiftRight') || !!pad?.buttons[6]?.pressed,
       emote: this.keys.has('KeyP') || !!pad?.buttons[3]?.pressed,
     }
+    // Buttons count even with no direction held: a standing dash or ability is still an input.
+    if (!any && !pad && !frame.dash && !frame.ability && !frame.brake && !frame.emote) return null
+    return frame
   }
 }

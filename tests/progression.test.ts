@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { defaultProfile, memoryStore, loadProfile, saveProfile, levelFromXp, xpForLevel } from '../src/progression/profile'
-import { achievementProgress, canReroll, liveDayStreak, refresh, refreshChallenges, rerollChallenge, settle } from '../src/progression/settle'
+import { achievementProgress, canReroll, isPodium, liveDayStreak, refresh, refreshChallenges, rerollChallenge, settle } from '../src/progression/settle'
 import { ACHIEVEMENTS, CHALLENGES, masteryLevel } from '../src/data/content'
 import type { MatchResult, Placement } from '../src/core/types'
 
@@ -163,6 +163,24 @@ describe('daily bonuses', () => {
   })
 })
 
+describe('podium', () => {
+  it('never counts last place, so losing a duel is not a podium', () => {
+    expect(isPodium(2, 2)).toBe(false)
+    expect(isPodium(1, 2)).toBe(true)
+    expect(isPodium(3, 6)).toBe(true)
+    expect(isPodium(4, 6)).toBe(false)
+    const duel = result({ placements: [placement({ place: 2, won: false }), placement({ id: 'b1', place: 1 })] }, {})
+    const out = settle(defaultProfile(), { ...duel, youId: 'you' }, DAY)
+    expect(out.profile.stats.podiums).toBe(0)
+  })
+
+  it('does not let a forfeit use up the day streak bonus', () => {
+    const forfeit = settle(defaultProfile(), result({ forfeit: true }, { place: 3, won: false }), DAY)
+    const next = settle(forfeit.profile, result({ matchId: 'm2' }), DAY)
+    expect(next.xpLines.some((l) => l.label.startsWith('Day'))).toBe(true)
+  })
+})
+
 describe('challenges', () => {
   it('clears finished challenges when the set rotates', () => {
     const profile = defaultProfile()
@@ -299,6 +317,16 @@ describe('rank', () => {
     expect(again.grants.some((g) => g.id.startsWith('season-end'))).toBe(false)
   })
 
+  it('does not refund the Gold cosmetics again on every ranked match', () => {
+    const profile = defaultProfile()
+    profile.rank.placementsLeft = 0
+    profile.rank.rating = 1400
+    const first = settle(profile, result({ competitive: true }), DAY)
+    expect(first.profile.owned).toContain('title_gold')
+    const second = settle(first.profile, result({ matchId: 'm2', competitive: true }), DAY)
+    expect(second.grants.some((g) => g.id.startsWith('refund-'))).toBe(false)
+  })
+
   it('pays overtime past the last season tier', () => {
     const profile = defaultProfile()
     profile.seasonXp = 6200 + 390
@@ -323,6 +351,12 @@ describe('refresh on load', () => {
     const coins = profile.coins
     expect(refresh(profile, DAY)).toEqual([])
     expect(profile.coins).toBe(coins)
+  })
+
+  it('claims the free first season tier without waiting for a match', () => {
+    const profile = defaultProfile()
+    refresh(profile, DAY)
+    expect(profile.seasonClaimed).toBeGreaterThanOrEqual(1)
   })
 
   it('keeps a forfeit out of mastery', () => {

@@ -109,7 +109,8 @@ export function sustainForces(bodies: Body[], wells: Well[], dt: number, time: n
       o.vx += (dx / d) * w.acc * dt
       o.vy += (dy / d) * w.acc * dt
       capSpeed(o)
-      if (time - o.lastHitTime > 0.45) {
+      // Arena wells have no owner and must not wipe the credit of whoever sent this ball in.
+      if (w.ownerId && time - o.lastHitTime > 0.45) {
         o.lastAttacker = w.ownerId
         o.lastHitTime = time
       }

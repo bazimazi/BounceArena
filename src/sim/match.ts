@@ -671,7 +671,7 @@ export class Match {
         if (!touch) continue
         if (touch.kind === 'laser' && (touch.impulseX !== 0 || touch.impulseY !== 0)) {
           const period = h.period || 2.6
-          const cycle = Math.floor(this.time / period)
+          const cycle = Math.floor((this.time - h.delay) / period)
           if (b.laserCycle !== cycle) {
             b.laserCycle = cycle
             b.vx += touch.impulseX

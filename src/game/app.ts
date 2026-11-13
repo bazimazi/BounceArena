@@ -95,7 +95,7 @@ class App {
       const match = this.session.match
       const you = match.players.find((p) => p.id === this.youId)
       const frame = you
-        ? this.input.player(you.x, you.y, (x, y) => this.renderer.toCss(x, y), this.profile.settings.mouseSteer)
+        ? this.input.player(you.x, you.y, (x, y) => this.renderer.toCss(x, y), this.profile.settings.mouseSteer, !this.lastOptions?.localDuo)
         : { ...ZERO_INPUT }
       const tick = match.playTick
       this.session.submit(this.youId, tick, frame)
@@ -175,10 +175,10 @@ class App {
     this.shell.onPause = () => this.togglePause()
     this.shell.onResume = () => this.togglePause()
     this.shell.onForfeit = () => this.leaveMatch()
-    this.shell.onMenu = () => this.leaveMatch()
+    this.shell.onMenu = () => this.leaveMatch(true)
   }
 
-  private finishMatch(): void {
+  private finishMatch(toMenu = false): void {
     if (!this.session || this.settled) return
     this.settled = true
     const result = this.session.match.toResult(this.youId)
@@ -192,16 +192,24 @@ class App {
       this.audio.win()
       this.renderer.confetti([you.color, '#ffc14d', '#ff4d3a', '#7ee0ff', '#f4f7fb'])
     } else this.audio.lose()
-    this.show('results')
+    if (toMenu) {
+      this.transition(() => {
+        this.session = null
+        this.show('menu')
+      })
+    } else this.show('results')
   }
 
-  private leaveMatch(): void {
+  /** Ends the match early. `toMenu` settles it and skips the results screen. */
+  private leaveMatch(toMenu = false): void {
     const match = this.session?.match
     if (match && match.status !== 'finished' && match.status !== 'celebrate') {
       const you = match.players.find((p) => p.id === this.youId)
-      if (you?.alive) match.forfeit(this.youId)
+      // Untimed modes have no other way out, so leaving ranks the field instead of forfeiting.
+      const untimed = match.config.duration <= 0
+      if (you?.alive && !untimed) match.forfeit(this.youId)
       else match.endNow()
-      this.finishMatch()
+      this.finishMatch(toMenu)
       return
     }
     this.transition(() => {
@@ -266,17 +274,21 @@ class App {
     const you = match.players.find((p) => p.id === this.youId)
     if (!you) return ''
     const taught = this.profile.taught
-    if (!taught.move && Math.hypot(you.vx, you.vy) < 40) return 'WASD to steer. You keep your speed when you let go.'
+    const touch = window.matchMedia('(pointer: coarse)').matches
+    const keys = touch
+      ? { steer: 'Drag the stick to steer', dash: 'DASH', ability: 'the ABILITY button', brake: 'BRAKE slows you' }
+      : { steer: 'WASD to steer', dash: 'Space', ability: 'F', brake: 'Shift brakes' }
+    if (!taught.move && Math.hypot(you.vx, you.vy) < 40) return `${keys.steer}. You keep your speed when you let go.`
     if (!taught.move) taught.move = true
     if (!taught.land && you.stats.survival < 2) return 'Landings give a burst if you are holding a direction.'
     if (you.sinceLand < 0.05) taught.land = true
     if (!taught.speed && you.stats.maxSpeed < 360) return 'Speed is power. Build it, then commit to the hit.'
     if (you.stats.maxSpeed >= 360) taught.speed = true
-    if (!taught.dash && you.stats.dashes < 1) return 'Space dashes. Tap it as you land for a perfect dash.'
+    if (!taught.dash && you.stats.dashes < 1) return `${keys.dash} dashes. Tap it as you land for a perfect dash.`
     if (you.stats.dashes > 0) taught.dash = true
-    if (!taught.ability && you.stats.abilityUses < 1) return `${abilityById(you.ability).name} is F. It is a decision, not a stat.`
+    if (!taught.ability && you.stats.abilityUses < 1) return `${abilityById(you.ability).name} is ${keys.ability}. It is a decision, not a stat.`
     if (you.stats.abilityUses > 0) taught.ability = true
-    if (!taught.edge && you.edgeDist < 110) return 'The edge is out. Shift brakes. Dash back toward the floor.'
+    if (!taught.edge && you.edgeDist < 110) return `The edge is out. ${keys.brake}. Dash back toward the floor.`
     if (you.stats.escapes > 0) taught.edge = true
     if (!taught.hit && you.stats.hits < 1) return 'A faster ball launches a slower one. Angle it toward the edge.'
     if (you.stats.hits > 0) taught.hit = true
@@ -466,6 +478,7 @@ class App {
       button.addEventListener('pointerdown', down)
       button.addEventListener('pointerup', up)
       button.addEventListener('pointerleave', up)
+      button.addEventListener('pointercancel', up)
     }
     hold(dash, 'touchDash')
     hold(ability, 'touchAbility')

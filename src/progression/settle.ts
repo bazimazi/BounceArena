@@ -112,8 +112,8 @@ export function settle(profile: Profile, result: MatchResult, now = new Date()):
   const beforeLevel = levelFromXp(next.accountXp)
   const today = dateKey(now)
 
-  // Day streak: consecutive calendar days with a finished match.
-  const firstToday = next.daily.lastDay !== today
+  // Day streak: consecutive calendar days with a finished match. A forfeit does not use up the day.
+  const firstToday = !result.forfeit && next.daily.lastDay !== today
   if (firstToday) {
     next.daily.streak = next.daily.lastDay === dateKey(addDays(now, -1)) ? next.daily.streak + 1 : 1
     next.daily.bestStreak = Math.max(next.daily.bestStreak, next.daily.streak)
@@ -133,7 +133,7 @@ export function settle(profile: Profile, result: MatchResult, now = new Date()):
   next.stats.wallKicks += you.wallKicks
   next.stats.escapes += you.escapes
   next.stats.abilityHits += you.abilityHits
-  if (you.place <= 3) next.stats.podiums += 1
+  if (isPodium(you.place, result.placements.length)) next.stats.podiums += 1
   next.stats.arenaPlays[result.arenaId] = (next.stats.arenaPlays[result.arenaId] ?? 0) + 1
   next.stats.abilityUses[you.ability] = (next.stats.abilityUses[you.ability] ?? 0) + you.abilityUses
   if (you.won) {
@@ -264,6 +264,7 @@ export function settle(profile: Profile, result: MatchResult, now = new Date()):
 export function refresh(profile: Profile, now = new Date()): Grant[] {
   refreshChallenges(profile, now)
   const grants = rollSeason(profile, now)
+  claimSeason(profile, grants, now)
   reconcile(profile, grants)
   return grants
 }
@@ -475,8 +476,8 @@ function settleRank(profile: Profile, you: Placement, result: MatchResult, grant
     rank.peakLabel = label
   }
   if (rating >= 1300) {
-    grantCosmetic(profile, 'title_gold', grants, 'Gold')
-    grantCosmetic(profile, 'impact_glyph', grants, 'Gold')
+    grantMissing(profile, 'title_gold', grants, 'Gold')
+    grantMissing(profile, 'impact_glyph', grants, 'Gold')
   }
   return { delta, reason, move }
 }
@@ -562,6 +563,11 @@ function rollSeason(profile: Profile, now: Date): Grant[] {
 
 function matchCoins(you: Placement, result: MatchResult): number {
   return 36 + (PLACE_XP[clampIndex(you.place - 1)] ?? 20) / 2 + you.elims * 6 + (result.competitive ? 10 : 0)
+}
+
+/** Top three, but never last: losing a duel is not a podium. */
+export function isPodium(place: number, field: number): boolean {
+  return place >= 1 && place <= Math.min(3, field - 1)
 }
 
 function levelCoins(level: number): number {
@@ -674,7 +680,7 @@ function challengeStat(stat: string, you: Placement, result: MatchResult): numbe
     case 'wins':
       return you.won ? 1 : 0
     case 'topThree':
-      return you.place <= 3 ? 1 : 0
+      return isPodium(you.place, result.placements.length) ? 1 : 0
     case 'multi2':
       return you.multiBest >= 2 ? 1 : 0
     case 'ranked':

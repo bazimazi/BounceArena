@@ -1,6 +1,7 @@
 import { clamp, lerp, mixHex, TAU } from '../core/math'
 import { SPEED_CAP, type FxEvent } from '../core/types'
 import { abilityById } from '../data/tuning'
+import { TEAM_COLORS } from '../data/content'
 import { solidPose, wallSegments, type Pose } from '../sim/geometry'
 import { explosiveWarn, hazardPose, laserAngle, laserMode } from '../sim/hazards'
 import type { Body } from '../sim/body'
@@ -414,6 +415,7 @@ export class Renderer {
       const p = project(b.x, b.y)
       const lift = Math.max(0, b.falling ? b.fallHeight : b.height) * zoom * 0.85
       this.shadow(p.x, p.y, b.radius * zoom * (b.falling ? 0.7 : 1), lift)
+      if (match.config.teams && !b.decoy && !b.falling) this.teamRing(p.x, p.y, b.radius * zoom, teamColor(b.team))
     }
     const sorted = [...front].sort((a, b) => a.y - b.y)
     for (const b of sorted) this.drawBall(b, project, zoom, prefs)
@@ -429,7 +431,7 @@ export class Renderer {
         if (Math.abs(other.x - p.x) < 80 * dpr && Math.abs(other.y - (p.y - lift)) < 20 * dpr) lift += 18 * dpr
       }
       placed.push({ x: p.x, y: p.y - lift })
-      this.label(b, p.x, p.y - lift, zoom, b.id === spectateId && !match.silent)
+      this.label(b, p.x, p.y - lift, zoom, b.id === spectateId && !match.silent, match.config.teams ? teamColor(b.team) : '')
     }
 
     this.screenFx(match, w, h, dt, prefs, focus, spectateId)
@@ -1463,7 +1465,17 @@ export class Renderer {
     }
   }
 
-  private label(b: Body, x: number, y: number, zoom: number, local: boolean): void {
+  /** Floor ring in the team colour, so partners read at a glance. */
+  private teamRing(x: number, y: number, r: number, color: string): void {
+    const ctx = this.ctx
+    ctx.beginPath()
+    ctx.ellipse(x, y + r * 0.15, r * 1.25, r * 0.6, 0, 0, TAU)
+    ctx.strokeStyle = hexA(color, 0.85)
+    ctx.lineWidth = 2.5 * this.dpr
+    ctx.stroke()
+  }
+
+  private label(b: Body, x: number, y: number, zoom: number, local: boolean, team = ''): void {
     const ctx = this.ctx
     const dpr = this.dpr
     const above = b.radius * zoom + 24 * dpr
@@ -1480,9 +1492,9 @@ export class Renderer {
     roundRect(ctx, x - pw / 2, ty - ph / 2, pw, ph, ph / 2)
     ctx.fillStyle = local ? b.color : 'rgba(6,10,16,0.72)'
     ctx.fill()
-    if (!local) {
-      ctx.strokeStyle = hexA(b.color, 0.7)
-      ctx.lineWidth = 1.2 * dpr
+    if (!local || team) {
+      ctx.strokeStyle = team || hexA(b.color, 0.7)
+      ctx.lineWidth = (team ? 2 : 1.2) * dpr
       ctx.stroke()
     }
     ctx.fillStyle = local ? '#0b0f14' : '#f4f7fb'
@@ -1945,6 +1957,10 @@ export class Renderer {
       })
     }
   }
+}
+
+function teamColor(team: number): string {
+  return TEAM_COLORS[team % TEAM_COLORS.length] ?? '#ffffff'
 }
 
 function hashN(n: number): number {

@@ -13,7 +13,7 @@ Open the local URL. `npm test` runs the physics, match, and progression tests. `
 
 ## Controls
 
-- WASD steer
+- WASD steer (arrow keys also steer when there is no local player 2)
 - Space dash
 - F ability
 - Shift brake
