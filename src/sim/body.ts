@@ -105,6 +105,9 @@ export interface Body {
   input: InputFrame
   prevDash: boolean
   prevAbility: boolean
+  /** Seconds left on a buffered dash or ability press. */
+  dashBuffer: number
+  abilityBuffer: number
   prevEmote: boolean
 
   stats: BodyStats
@@ -128,6 +131,8 @@ export interface Body {
   botLock: number
   /** A soft-lobby bot: gives humans a warm-up window before hunting them. */
   soft: boolean
+  /** Seconds a bot has been in edge panic. Its save dash waits for a human reaction time. */
+  botPanic: number
 
   decoy: boolean
   ownerId: string
@@ -243,6 +248,8 @@ export function createBody(cfg: PlayerConfig, stocks: number, competitive: boole
     input: { ...ZERO_INPUT },
     prevDash: false,
     prevAbility: false,
+    dashBuffer: 0,
+    abilityBuffer: 0,
     prevEmote: false,
     stats: emptyStats(),
     launching: false,
@@ -262,6 +269,7 @@ export function createBody(cfg: PlayerConfig, stocks: number, competitive: boole
     botTarget: '',
     botLock: 0,
     soft: pace < 1,
+    botPanic: 0,
     decoy: false,
     ownerId: '',
     decoyLife: 0,

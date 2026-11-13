@@ -8,7 +8,7 @@ import { attractConfig, buildMatchConfig, type PlayOptions } from '../game/setup
 import { Input } from '../input/input'
 import { loadProfile, saveProfile, type Profile } from '../progression/profile'
 import { buyCosmetic, equipCosmetic, refresh, rerollChallenge, settle, type Grant, type SettleOutcome } from '../progression/settle'
-import { Renderer } from '../render/render'
+import { Renderer, TILT } from '../render/render'
 import { Match } from '../sim/match'
 import { Session } from '../sim/session'
 import { Shell, type PlayDraft } from '../ui/ui'
@@ -134,7 +134,7 @@ class App {
       const match = this.session.match
       const you = match.players.find((p) => p.id === this.youId)
       const frame = you
-        ? this.input.player(you.x, you.y, (x, y) => this.renderer.toCss(x, y), this.profile.settings.mouseSteer, !this.lastOptions?.localDuo)
+        ? this.input.player(you.x, you.y, (x, y) => this.renderer.toCss(x, y), this.profile.settings.mouseSteer, !this.lastOptions?.localDuo, TILT)
         : { ...ZERO_INPUT }
       const tick = match.playTick
       this.session.submit(this.youId, tick, frame)
@@ -168,8 +168,7 @@ class App {
   private draw(): void {
     const prefs = this.prefs()
     const alpha = clamp(this.acc / DT, 0, 1)
-    const menu = this.screen !== 'match' && this.screen !== 'results'
-    const bias = menu ? Math.min(220, window.innerWidth * 0.18) : 0
+    const bias = 0
     if (this.highlight) {
       this.renderer.draw(this.highlight, alpha, prefs, 0, this.youId)
       return
@@ -287,6 +286,7 @@ class App {
       return
     }
     this.paused = !this.paused
+    this.shell.setSettings(this.profile.settings)
     if (this.paused) this.shell.showPause()
     else this.shell.hidePause()
   }
@@ -310,6 +310,8 @@ class App {
     this.highlightLeft = 3.2
     uiRoot.replaceChildren()
     hudRoot.hidden = true
+    // The results scrim dims and blurs the canvas; the replay needs a clear view.
+    document.body.dataset.mode = 'replay'
   }
 
   private hint(match: Match): string {
@@ -440,7 +442,8 @@ class App {
     this.touch.ability.style.setProperty('--p', ability.toFixed(3))
     this.touch.ability.classList.toggle('ready', you.abilityCd <= 0)
     const name = abilityById(you.ability).name.toUpperCase()
-    if (this.touch.ability.textContent !== name) this.touch.ability.textContent = name
+    const label = this.touch.ability.querySelector('span')
+    if (label && label.textContent !== name) label.textContent = name
   }
 
   private prefs() {
@@ -499,6 +502,12 @@ class App {
     this.shell.onTwist = () => {
       const twist = dailyTwist()
       this.play({ modeId: twist.modeId, arenaId: twist.arenaId, competitive: false, players: 0, mutators: twist.mutators })
+    }
+    this.shell.onColor = (index) => {
+      this.audio.click()
+      this.profile.color = index
+      saveProfile(this.profile)
+      this.shell.showLoadout(this.profile)
     }
     this.shell.onName = (name) => {
       this.profile.name = name

@@ -230,8 +230,9 @@ export const ARENAS: ArenaDef[] = [
     hazards: [],
     spawns: spawns(8, 190),
     final: 'laser',
-    shrinkRate: 0,
-    shrinkDelay: 0,
+    // Open floors tighten from mid-match so the fight builds instead of stalling.
+    shrinkRate: 1.4,
+    shrinkDelay: 30,
   },
   {
     id: 'ring',
@@ -310,8 +311,9 @@ export const ARENAS: ArenaDef[] = [
     ],
     spawns: spawns(8, 250),
     final: 'laser',
-    shrinkRate: 0,
-    shrinkDelay: 0,
+    // Open floors tighten from mid-match so the fight builds instead of stalling.
+    shrinkRate: 1.4,
+    shrinkDelay: 30,
   },
   {
     id: 'hazard-core',
@@ -396,8 +398,9 @@ export const ARENAS: ArenaDef[] = [
     ],
     spawns: spawns(8, 240),
     final: 'laser',
-    shrinkRate: 0,
-    shrinkDelay: 0,
+    // Open floors tighten from mid-match so the fight builds instead of stalling.
+    shrinkRate: 1.4,
+    shrinkDelay: 30,
   },
   {
     id: 'collapse',
@@ -471,8 +474,9 @@ export const ARENAS: ArenaDef[] = [
     hazards: [],
     spawns: spawns(8, 200),
     final: 'laser',
-    shrinkRate: 0,
-    shrinkDelay: 0,
+    // Open floors tighten from mid-match so the fight builds instead of stalling.
+    shrinkRate: 1.4,
+    shrinkDelay: 30,
   },
   {
     id: 'moving',
@@ -514,8 +518,9 @@ export const ARENAS: ArenaDef[] = [
     hazards: [],
     spawns: spawns(8, 340, -Math.PI / 2 + 0.2),
     final: 'shrink',
-    shrinkRate: 0,
-    shrinkDelay: 0,
+    // Open floors tighten from mid-match so the fight builds instead of stalling.
+    shrinkRate: 1.4,
+    shrinkDelay: 30,
   },
 ]
 

@@ -1,4 +1,4 @@
-import { clamp, lerp, mixHex, TAU } from '../core/math'
+import { TAU, clamp, lerp } from '../core/math'
 import { SPEED_CAP, type FxEvent } from '../core/types'
 import { abilityById } from '../data/tuning'
 import { TEAM_COLORS } from '../data/content'
@@ -6,6 +6,15 @@ import { solidPose, wallSegments, type Pose } from '../sim/geometry'
 import { explosiveWarn, hazardPose, laserAngle, laserMode } from '../sim/hazards'
 import type { Body } from '../sim/body'
 import type { Match } from '../sim/match'
+import { blinkAt, paintBall, type BallLook, type Expression } from './ball'
+import { DISPLAY_FONT, UI_FONT, easeInCubic, easeOutBack, easeOutCubic, hashN, hexA, mixHex, roundRect, shade } from './util'
+
+/** Camera pitch: world y is squashed by this on screen, so the floor reads as a tilted plane. */
+export const TILT = 0.8
+/** Platform thickness in world units. */
+const DEPTH = 58
+const WALL_H = 26
+const MAX_PARTICLES = 1100
 
 export interface RenderPrefs {
   shake: number
@@ -19,7 +28,7 @@ export interface RenderPrefs {
 
 /** Heat colour ramp: white, yellow, orange, red, then deep red past 200%. */
 export function heatColor(heat: number): string {
-  const stops: [number, string][] = [[0, '#f4f7fb'], [45, '#ffe066'], [90, '#ff9f3a'], [140, '#ff4d3a'], [200, '#b0102a']]
+  const stops: [number, string][] = [[0, '#f4f7fb'], [45, '#ffe066'], [90, '#ff9f3a'], [140, '#ff4d3a'], [200, '#c2142e']]
   for (let i = 1; i < stops.length; i++) {
     const [h1, c1] = stops[i]!
     const [h0, c0] = stops[i - 1]!
@@ -28,32 +37,22 @@ export function heatColor(heat: number): string {
   return stops[stops.length - 1]![1]
 }
 
-type Project = (x: number, y: number) => { x: number; y: number }
-
-type ParticleKind =
-  | 'spark'
-  | 'dust'
-  | 'ring'
-  | 'text'
-  | 'stamp'
-  | 'confetti'
-  | 'shard'
-  | 'ember'
-  | 'flash'
-  | 'beam'
-  | 'pillar'
-  | 'bolt'
-  | 'star'
+type Kind =
+  | 'spark' | 'chunk' | 'puff' | 'ring' | 'implode' | 'sring' | 'flash' | 'text' | 'stamp' | 'confetti'
+  | 'beam' | 'pillar' | 'ember' | 'smoke' | 'star' | 'shard' | 'bolt' | 'scorch' | 'faller' | 'streak' | 'zzz'
 
 interface Particle {
-  kind: ParticleKind
+  kind: Kind
   x: number
   y: number
+  z: number
   vx: number
   vy: number
+  vz: number
+  /** Gravity on z, world units/s². */
+  g: number
   life: number
   max: number
-  /** World units for rings and beams, CSS px for sprites. */
   size: number
   color: string
   text: string
@@ -61,17 +60,11 @@ interface Particle {
   spin: number
   drag: number
   seed: number
-  /** Victim id for merged hit numbers. */
   owner?: string
-}
-
-interface Star {
-  x: number
-  y: number
-  r: number
-  a: number
-  depth: number
-  tw: number
+  look?: BallLook
+  behind?: boolean
+  x2?: number
+  y2?: number
 }
 
 /** Presentation-only state per ball. Never feeds back into the sim. */
@@ -80,26 +73,67 @@ interface BallFx {
   squashV: number
   squashAng: number
   land: number
-  roll: number
-  vx: number
-  vy: number
-  ghosts: { x: number; y: number; life: number }[]
+  lookX: number
+  lookY: number
+  hurt: number
+  focus: number
+  idle: number
+  ghosts: { x: number; y: number; z: number; life: number }[]
   ghostTimer: number
   emberTimer: number
+  smokeTimer: number
+  zzzTimer: number
+  /** Drop-in from the sky: 1 at the top, 0 landed. */
+  drop: number
+  dropDelay: number
+  lastX: number
+  lastY: number
+  seed: number
+  perfect: number
 }
 
-const MAX_PARTICLES = 700
+interface Mote {
+  x: number
+  y: number
+  z: number
+  r: number
+  s: number
+}
+
+interface Rock {
+  x: number
+  y: number
+  r: number
+  depth: number
+  spin: number
+  seed: number
+}
+
+type Project = (x: number, y: number, z?: number) => { x: number; y: number }
+
+interface DrawItem {
+  y: number
+  draw: () => void
+}
 
 export class Renderer {
   private ctx: CanvasRenderingContext2D
-  private stars: Star[] = []
   private particles: Particle[] = []
   private balls = new Map<string, BallFx>()
-  private floorPattern: CanvasPattern | null = null
+  private hexPattern: CanvasPattern | null = null
+  private lipPattern: CanvasPattern | null = null
+  private lipKey = ''
+  private bgCache: { key: string; canvas: HTMLCanvasElement } | null = null
+  private motes: Mote[] = []
+  private rocks: Rock[] = []
   private dpr = 1
+  /** Highest pixel density allowed. Lowered on its own when frames run long. */
+  private dprCap = 2
+  private frameEma = 16
+  private slowFrames = 0
   private camX = 0
   private camY = 0
-  private camZoom = 1
+  private camZoom = 0
   private trauma = 0
   private kickX = 0
   private kickY = 0
@@ -117,6 +151,11 @@ export class Renderer {
   private matchRef: Match | null = null
   private speedLines = 0
   private jitterId = ''
+  private Z = 1
+  private OX = 0
+  private OY = 0
+  private labelScale = 1
+  private css: (x: number, y: number, z?: number) => { x: number; y: number } = (x, y) => ({ x, y })
   width = 1
   height = 1
 
@@ -124,18 +163,28 @@ export class Renderer {
     const ctx = canvas.getContext('2d')
     if (!ctx) throw new Error('Canvas is unavailable')
     this.ctx = ctx
-    this.seedStars()
+    for (let i = 0; i < 70; i++) {
+      this.motes.push({ x: hashN(i * 3.1), y: hashN(i * 5.7), z: 0.2 + hashN(i * 9.3) * 0.8, r: 0.6 + hashN(i * 2.2) * 1.8, s: 0.2 + hashN(i * 4.4) })
+    }
+    for (let i = 0; i < 9; i++) {
+      this.rocks.push({ x: (hashN(i * 13.1) - 0.5) * 2.4, y: 0.15 + hashN(i * 7.7) * 0.9, r: 18 + hashN(i * 3.3) * 60, depth: 0.15 + hashN(i * 5.1) * 0.35, spin: (hashN(i) - 0.5) * 0.2, seed: i })
+    }
   }
 
   resize(): void {
-    this.dpr = Math.min(2, window.devicePixelRatio || 1)
+    // Very large canvases cost fill rate for little visible gain; keep under ~4.2 MP.
+    const css = Math.max(1, window.innerWidth * window.innerHeight)
+    const budget = Math.sqrt(4_200_000 / css)
+    this.dpr = Math.max(1, Math.min(this.dprCap, window.devicePixelRatio || 1, budget))
     this.width = window.innerWidth
     this.height = window.innerHeight
     this.canvas.width = Math.floor(this.width * this.dpr)
     this.canvas.height = Math.floor(this.height * this.dpr)
     this.canvas.style.width = `${this.width}px`
     this.canvas.style.height = `${this.height}px`
-    this.floorPattern = null
+    this.hexPattern = null
+    this.lipPattern = null
+    this.bgCache = null
   }
 
   /**
@@ -149,7 +198,7 @@ export class Renderer {
     }
     if (this.slow > 0) {
       this.slow -= dt
-      return this.slow > 0.4 ? 0.2 : lerp(1, 0.2, this.slow / 0.4)
+      return this.slow > 0.45 ? 0.18 : lerp(1, 0.18, this.slow / 0.45)
     }
     return 1
   }
@@ -166,27 +215,33 @@ export class Renderer {
     this.hitstop = 0
     this.slow = 0
     this.finish = null
+    this.matchRef = null
   }
 
   /** Smash-style finish: slow the clock and push the camera onto the last knockout. */
   finale(x: number, y: number, color: string, prefs: RenderPrefs): void {
     if (this.finish) return
-    this.finish = { x, y, life: 1.5, max: 1.5, color }
-    if (!prefs.reducedMotion) this.slow = 1.25
-    if (prefs.flashes !== false) this.flashA = Math.max(this.flashA, 0.35)
+    this.finish = { x, y, life: 1.7, max: 1.7, color }
+    if (!prefs.reducedMotion) this.slow = 1.35
+    if (prefs.flashes !== false) this.flashA = Math.max(this.flashA, 0.4)
     this.flashColor = color
-    this.trauma = Math.min(1, this.trauma + 0.4 * prefs.shake)
+    this.trauma = Math.min(1, this.trauma + 0.45 * prefs.shake)
   }
 
   /** Confetti over the whole view, for a win on the results screen. */
   confetti(colors: string[]): void {
     const view = this.matchRef?.arena.view ?? 560
-    for (let i = 0; i < 90; i++) {
-      const x = this.camX + (Math.random() - 0.5) * view * 2
-      const y = this.camY - view * (0.9 + Math.random() * 0.5)
-      this.add('confetti', x, y, (Math.random() - 0.5) * 60, 140 + Math.random() * 160, 3 + Math.random() * 2.5, colors[i % colors.length] ?? '#ffc14d', 2.6 + Math.random() * 1.2, 0.2)
+    for (let i = 0; i < 140; i++) {
+      const x = this.camX + (Math.random() - 0.5) * view * 2.2
+      const y = this.camY + (Math.random() - 0.5) * view * 1.4
+      this.add({
+        kind: 'confetti', x, y, z: 500 + Math.random() * 500, vx: (Math.random() - 0.5) * 80, vy: (Math.random() - 0.5) * 40, vz: -60 - Math.random() * 120,
+        g: 160, size: 3 + Math.random() * 3, color: colors[i % colors.length] ?? '#ffc14d', life: 3.2 + Math.random() * 1.5, drag: 0.6, spin: (Math.random() - 0.5) * 12,
+      })
     }
   }
+
+  // ================================================================ events
 
   absorb(events: FxEvent[], prefs: RenderPrefs, localId: string, match: Match): void {
     const full = prefs.fx === 'full'
@@ -194,155 +249,286 @@ export class Renderer {
     const shake = prefs.shake * motion
     for (const e of events) {
       const local = !!localId && (e.actorId === localId || e.victimId === localId)
-      if (e.type === 'hit') {
-        const victim = match.bodies.find((b) => b.id === e.victimId)
-        const actor = match.bodies.find((b) => b.id === e.actorId)
-        let nx = 1
-        let ny = 0
-        if (victim) {
-          const d = Math.hypot(victim.x - e.x, victim.y - e.y)
-          if (d > 0.01) {
-            nx = (victim.x - e.x) / d
-            ny = (victim.y - e.y) / d
-          }
-        }
-        const k = clamp(e.power / 900, 0, 1.2)
-        const n = full ? Math.round(8 + k * 16) : 4
-        for (let i = 0; i < n; i++) {
-          const spread = (Math.random() - 0.5) * (i % 3 === 0 ? Math.PI * 2 : 1.4)
-          const a = Math.atan2(ny, nx) + spread
-          const s = (180 + k * 520) * (0.4 + Math.random() * 0.8)
-          this.add('spark', e.x, e.y, Math.cos(a) * s, Math.sin(a) * s, 1.6 + Math.random() * 1.6 + k, i % 4 === 0 ? '#ffffff' : e.color, 0.22 + Math.random() * 0.2 + k * 0.15, 5)
-        }
-        this.ring(e.x, e.y, e.color, 16 + k * 46, 0.34 + k * 0.1, 3 + k * 4)
-        if (k > 0.35) this.ring(e.x, e.y, '#ffffff', 10 + k * 28, 0.2, 2)
-        this.add('flash', e.x, e.y, 0, 0, 14 + k * 38, '#ffffff', 0.09 + k * 0.05, 0)
-        this.impactStyle(actor?.impact ?? 'impact_ring', e.x, e.y, e.color, k, full)
-        if (e.power > 560 && full) this.bolts(e.x, e.y, Math.atan2(ny, nx), k)
-        if (e.text && prefs.numbers !== false) this.popNumber(e.x, e.y - 18, e.text, e.power, e.victimId)
-        if (victim) this.jitterId = victim.id
-        if (victim) {
-          const fx = this.fxFor(victim)
-          fx.squashAng = Math.atan2(ny, nx)
-          fx.squashV -= 7 + k * 9
-        }
-        if (actor) {
-          const fx = this.fxFor(actor)
-          fx.squashAng = Math.atan2(ny, nx)
-          fx.squashV -= 3 + k * 4
-        }
-        this.trauma = Math.min(1, this.trauma + (local ? 0.16 + k * 0.34 : 0.04 + k * 0.1) * shake)
-        if (local) {
-          this.kickVX += nx * (60 + k * 260) * motion
-          this.kickVY += ny * (60 + k * 260) * motion
-          this.punch = Math.max(this.punch, k * 0.06 * motion)
-        }
-        if (local || e.power > 640) this.hitstop = Math.max(this.hitstop, clamp(0.016 + k * 0.085, 0.02, 0.11))
-        if (local && e.power > 780 && full && !prefs.reducedMotion && prefs.flashes !== false) this.impactFrames = 1
-      } else if (e.type === 'dash') {
-        const b = match.bodies.find((x) => x.id === e.actorId)
-        const a = b ? Math.atan2(b.vy, b.vx) + Math.PI : Math.random() * TAU
-        for (let i = 0; i < (full ? 7 : 3); i++) {
-          const aa = a + (Math.random() - 0.5) * 1.3
-          const s = 60 + Math.random() * 120
-          this.add('dust', e.x, e.y, Math.cos(aa) * s, Math.sin(aa) * s, 5 + Math.random() * 6, '#dfe9f5', 0.35 + Math.random() * 0.2, 4)
-        }
-        this.ring(e.x, e.y, e.color, 22, 0.22, 2)
-        if (b) {
-          const fx = this.fxFor(b)
-          fx.ghostTimer = 0.32
-          fx.squashAng = Math.atan2(b.vy, b.vx)
-          fx.squashV += 6
-        }
-        if (local) this.trauma = Math.min(1, this.trauma + 0.05 * shake)
-      } else if (e.type === 'elim') {
-        const victim = match.bodies.find((b) => b.id === e.victimId)
-        const color = victim?.color ?? e.color
-        const fx = victim ? this.balls.get(victim.id) : undefined
-        let dx = fx ? fx.vx : 0
-        let dy = fx ? fx.vy : 0
-        if (Math.hypot(dx, dy) < 30) {
-          dx = e.x
-          dy = e.y
-        }
-        const ang = Math.atan2(dy, dx)
-        this.add('beam', e.x, e.y, 0, 0, 1, color, 0.85, 0, ang)
-        this.ring(e.x, e.y, '#ffffff', 70, 0.5, 5)
-        this.ring(e.x, e.y, color, 110, 0.7, 8)
-        const bits = full ? 34 : 10
-        for (let i = 0; i < bits; i++) {
-          const a = ang + (Math.random() - 0.5) * 1.6
-          const s = 200 + Math.random() * 520
-          const c = i % 3 === 0 ? e.color : i % 3 === 1 ? color : '#ffffff'
-          if (i % 2 === 0) this.add('confetti', e.x, e.y, Math.cos(a) * s, Math.sin(a) * s, 3 + Math.random() * 3, c, 1 + Math.random() * 0.6, 2.4)
-          else this.add('spark', e.x, e.y, Math.cos(a) * s * 1.3, Math.sin(a) * s * 1.3, 2.5, c, 0.4 + Math.random() * 0.3, 3)
-        }
-        this.add('stamp', e.x, e.y - 30, 0, -24, local ? 34 : 24, e.victimId === localId ? '#ff4d3a' : '#fff7ea', 1.05, 0, (Math.random() - 0.5) * 0.3, 'KO!')
-        if (prefs.flashes !== false) {
-          this.flashA = Math.max(this.flashA, (local ? 0.32 : 0.1) * motion)
-          this.flashColor = color
-        }
-        this.trauma = Math.min(1, this.trauma + (local ? 0.55 : 0.22) * shake)
-        if (local) {
-          this.hitstop = Math.max(this.hitstop, 0.12)
-          this.punch = Math.max(this.punch, 0.08 * motion)
-        }
-      } else if (e.type === 'boom') {
-        this.ring(e.x, e.y, e.color, 70, 0.5, 8)
-        this.ring(e.x, e.y, '#ffffff', 40, 0.25, 3)
-        this.add('flash', e.x, e.y, 0, 0, 60, '#fff1c4', 0.14, 0)
-        for (let i = 0; i < (full ? 22 : 8); i++) {
-          const a = Math.random() * TAU
-          const s = 120 + Math.random() * 380
-          if (i % 2) this.add('spark', e.x, e.y, Math.cos(a) * s, Math.sin(a) * s, 2.5, i % 3 ? e.color : '#ffc14d', 0.4 + Math.random() * 0.3, 4)
-          else this.add('dust', e.x, e.y, Math.cos(a) * s * 0.35, Math.sin(a) * s * 0.35, 10 + Math.random() * 12, '#3a3040', 0.8 + Math.random() * 0.5, 2)
-        }
-        this.trauma = Math.min(1, this.trauma + 0.22 * shake)
-      } else if (e.type === 'land') {
+      if (e.type === 'hit') this.onHit(e, match, local, full, prefs, motion, shake)
+      else if (e.type === 'dash') this.onDash(e, match, local, full, shake)
+      else if (e.type === 'elim') this.onElim(e, match, localId, local, full, prefs, motion, shake)
+      else if (e.type === 'boom') this.onBoom(e, full, shake)
+      else if (e.type === 'land') {
         const b = match.bodies.find((x) => x.id === e.actorId)
         if (b) this.fxFor(b).land = 1
-        if (full) {
-          for (let i = 0; i < 3; i++) {
-            const a = Math.random() * TAU
-            this.add('dust', e.x, e.y, Math.cos(a) * 40, Math.sin(a) * 40, 4 + Math.random() * 3, '#cfd9e6', 0.3, 4)
+        if (full && b && Math.hypot(b.vx, b.vy) > 140) {
+          const a = Math.atan2(b.vy, b.vx) + Math.PI
+          for (let i = 0; i < 2; i++) {
+            const aa = a + (Math.random() - 0.5) * 1.4
+            this.add({ kind: 'puff', x: e.x, y: e.y, z: 2, vx: Math.cos(aa) * 50, vy: Math.sin(aa) * 50, size: 5 + Math.random() * 4, color: '#dfe9f5', life: 0.35, drag: 4 })
           }
         }
       } else if (e.type === 'wall') {
-        for (let i = 0; i < (full ? 8 : 3); i++) {
+        for (let i = 0; i < (full ? 12 : 4); i++) {
           const a = Math.random() * TAU
-          const s = 120 + Math.random() * 220
-          this.add('spark', e.x, e.y, Math.cos(a) * s, Math.sin(a) * s, 1.8, i % 2 ? '#ffffff' : e.color, 0.25, 6)
+          const s = 140 + Math.random() * 260
+          this.add({ kind: 'spark', x: e.x, y: e.y, z: 16, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: 80 + Math.random() * 200, g: 900, size: 1.8, color: i % 2 ? '#ffffff' : e.color, life: 0.3, drag: 5 })
         }
-        this.ring(e.x, e.y, e.color, 18, 0.22, 2)
-      } else if (e.type === 'ability') {
-        this.ring(e.x, e.y, e.color, 60, 0.45, 5)
-        this.ring(e.x, e.y, '#ffffff', 34, 0.3, 2)
-        if (local && e.text) {
-          const def = abilityById(e.text)
-          if (def.id === e.text) this.add('text', e.x, e.y - 34, 0, -40, 15, e.color, 0.8, 0, 0, def.name.toUpperCase())
+        this.ring(e.x, e.y, e.color, 26, 0.26, 3)
+        this.add({ kind: 'flash', x: e.x, y: e.y, z: 16, size: 26, color: e.color, life: 0.1 })
+      } else if (e.type === 'ability') this.onAbility(e, match, local, full)
+      else if (e.type === 'pickup') {
+        this.ring(e.x, e.y, e.color, 60, 0.5, 5)
+        this.add({ kind: 'sring', x: e.x, y: e.y, z: 24, size: 50, color: '#ffffff', life: 0.35, spin: 3 })
+        for (let i = 0; i < 12; i++) {
+          const a = (i / 12) * TAU
+          this.add({ kind: 'star', x: e.x, y: e.y, z: 24, vx: Math.cos(a) * 200, vy: Math.sin(a) * 200, vz: 120, g: 300, size: 7, color: e.color, life: 0.65, drag: 3 })
         }
-      } else if (e.type === 'pickup') {
-        this.ring(e.x, e.y, e.color, 40, 0.4, 4)
-        for (let i = 0; i < 8; i++) {
-          const a = (i / 8) * TAU
-          this.add('star', e.x, e.y, Math.cos(a) * 160, Math.sin(a) * 160, 7, e.color, 0.55, 4, 0, '', 6)
-        }
-        if (e.text) this.add('text', e.x, e.y - 30, 0, -40, 16, e.color, 0.9, 0, 0, e.text)
+        if (e.text) this.add({ kind: 'text', x: e.x, y: e.y, z: 70, vz: 60, size: 20, color: e.color, life: 1, drag: 2, text: e.text })
       } else if (e.type === 'save') {
-        this.ring(e.x, e.y, '#3ee6a0', 44, 0.45, 4)
-        if (local) this.add('text', e.x, e.y - 30, 0, -46, 18, '#3ee6a0', 0.95, 0, 0, 'SAVED!')
+        this.ring(e.x, e.y, '#3ee6a0', 60, 0.5, 5)
+        for (let i = 0; i < 10; i++) {
+          const a = Math.random() * TAU
+          this.add({ kind: 'star', x: e.x, y: e.y, z: 20, vx: Math.cos(a) * 140, vy: Math.sin(a) * 140, vz: 220, g: 600, size: 5, color: '#3ee6a0', life: 0.6, drag: 2 })
+        }
+        if (local) this.add({ kind: 'text', x: e.x, y: e.y, z: 70, vz: 70, size: 24, color: '#3ee6a0', life: 1.1, drag: 2, text: 'SAVED!' })
       } else if (e.type === 'spawn') {
-        this.add('pillar', e.x, e.y, 0, 0, 34, e.color, 0.6, 0)
-        this.ring(e.x, e.y, e.color, 46, 0.5, 4)
         const b = match.bodies.find((x) => x.id === e.actorId)
         if (b) {
           const fx = this.fxFor(b)
-          fx.land = 1.4
+          fx.drop = 1
+          fx.dropDelay = 0
           fx.ghosts = []
         }
+        this.add({ kind: 'pillar', x: e.x, y: e.y, z: 0, size: 40, color: e.color, life: 0.7 })
       }
     }
   }
+
+  private onHit(e: FxEvent, match: Match, local: boolean, full: boolean, prefs: RenderPrefs, motion: number, shake: number): void {
+    const victim = match.bodies.find((b) => b.id === e.victimId)
+    const actor = match.bodies.find((b) => b.id === e.actorId)
+    let nx = 1
+    let ny = 0
+    if (victim) {
+      const d = Math.hypot(victim.x - e.x, victim.y - e.y)
+      if (d > 0.01) {
+        nx = (victim.x - e.x) / d
+        ny = (victim.y - e.y) / d
+      }
+    }
+    const k = clamp(e.power / 900, 0, 1.2)
+    const ang = Math.atan2(ny, nx)
+    const z = 20
+    const n = full ? Math.round(12 + k * 22) : 5
+    for (let i = 0; i < n; i++) {
+      const spread = (Math.random() - 0.5) * (i % 3 === 0 ? TAU : 1.3)
+      const a = ang + spread
+      const s = (220 + k * 620) * (0.35 + Math.random() * 0.8)
+      this.add({
+        kind: 'spark', x: e.x, y: e.y, z, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: 60 + Math.random() * 320, g: 1100,
+        size: 1.6 + Math.random() * 1.8 + k, color: i % 4 === 0 ? '#ffffff' : e.color, life: 0.25 + Math.random() * 0.25 + k * 0.15, drag: 3.5,
+      })
+    }
+    this.ring(e.x, e.y, e.color, 22 + k * 60, 0.36 + k * 0.12, 4 + k * 5)
+    if (k > 0.3) this.ring(e.x, e.y, '#ffffff', 14 + k * 34, 0.22, 2.5)
+    this.add({ kind: 'flash', x: e.x, y: e.y, z, size: 18 + k * 48, color: '#ffffff', life: 0.09 + k * 0.06 })
+    this.add({ kind: 'sring', x: e.x, y: e.y, z, size: 18 + k * 40, color: mixHex(e.color, '#ffffff', 0.5), life: 0.2 + k * 0.1, spin: 2 + k * 3 })
+    if (full && k > 0.45) {
+      for (let i = 0; i < Math.round(k * 6); i++) {
+        const a = ang + (Math.random() - 0.5) * 1.2
+        const s = 180 + Math.random() * 300
+        this.add({ kind: 'chunk', x: e.x, y: e.y, z, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: 200 + Math.random() * 260, g: 1200, size: 3 + Math.random() * 3, color: e.color, life: 0.8, drag: 1.5, spin: (Math.random() - 0.5) * 20 })
+      }
+    }
+    this.impactStyle(actor?.impact ?? 'impact_ring', e.x, e.y, e.color, k, full)
+    if (e.power > 560 && full) this.bolts(e.x, e.y, ang, k)
+    if (e.text && prefs.numbers !== false) this.popNumber(e.x, e.y, e.text, e.power, e.victimId)
+    if (victim) {
+      this.jitterId = victim.id
+      const fx = this.fxFor(victim)
+      fx.squashAng = ang
+      fx.squashV -= 8 + k * 10
+      fx.hurt = 0.35 + k * 0.3
+    }
+    if (actor) {
+      const fx = this.fxFor(actor)
+      fx.squashAng = ang
+      fx.squashV -= 3 + k * 4
+      fx.focus = 0.6
+    }
+    this.trauma = Math.min(1, this.trauma + (local ? 0.18 + k * 0.38 : 0.04 + k * 0.1) * shake)
+    if (local) {
+      this.kickVX += nx * (70 + k * 300) * motion
+      this.kickVY += ny * (70 + k * 300) * motion * TILT
+      this.punch = Math.max(this.punch, k * 0.07 * motion)
+    }
+    if (local || e.power > 640) this.hitstop = Math.max(this.hitstop, clamp(0.018 + k * 0.09, 0.02, 0.12))
+    if (local && e.power > 780 && full && !prefs.reducedMotion && prefs.flashes !== false) this.impactFrames = 2
+  }
+
+  private onDash(e: FxEvent, match: Match, local: boolean, full: boolean, shake: number): void {
+    const b = match.bodies.find((x) => x.id === e.actorId)
+    const a = b ? Math.atan2(b.vy, b.vx) + Math.PI : Math.random() * TAU
+    for (let i = 0; i < (full ? 9 : 3); i++) {
+      const aa = a + (Math.random() - 0.5) * 1.4
+      const s = 70 + Math.random() * 150
+      this.add({ kind: 'puff', x: e.x, y: e.y, z: 3, vx: Math.cos(aa) * s, vy: Math.sin(aa) * s, size: 6 + Math.random() * 7, color: '#e6eef8', life: 0.4 + Math.random() * 0.25, drag: 4 })
+    }
+    this.ring(e.x, e.y, e.color, 30, 0.26, 3)
+    if (b) {
+      const fx = this.fxFor(b)
+      fx.ghostTimer = 0.3
+      fx.squashAng = Math.atan2(b.vy, b.vx)
+      fx.squashV += 7
+      fx.focus = 0.5
+      if (e.text === 'perfect') {
+        fx.perfect = 0.5
+        this.ring(e.x, e.y, '#ffc14d', 54, 0.4, 5)
+        this.add({ kind: 'sring', x: e.x, y: e.y, z: 22, size: 40, color: '#ffe39c', life: 0.3, spin: 3 })
+        for (let i = 0; i < 8; i++) {
+          const q = (i / 8) * TAU
+          this.add({ kind: 'star', x: e.x, y: e.y, z: 22, vx: Math.cos(q) * 170, vy: Math.sin(q) * 170, vz: 80, g: 200, size: 5, color: '#ffc14d', life: 0.45, drag: 3 })
+        }
+        if (local) this.add({ kind: 'text', x: e.x, y: e.y, z: 64, vz: 80, size: 19, color: '#ffc14d', life: 0.85, drag: 2.5, text: 'PERFECT' })
+      }
+    }
+    if (local) this.trauma = Math.min(1, this.trauma + 0.06 * shake)
+  }
+
+  private onElim(e: FxEvent, match: Match, localId: string, local: boolean, full: boolean, prefs: RenderPrefs, motion: number, shake: number): void {
+    const victim = match.bodies.find((b) => b.id === e.victimId)
+    const color = victim?.color ?? e.color
+    const fx = victim ? this.balls.get(victim.id) : undefined
+    let dx = victim ? victim.vx : 0
+    let dy = victim ? victim.vy : 0
+    if (Math.hypot(dx, dy) < 30) {
+      dx = e.x
+      dy = e.y
+    }
+    const ang = Math.atan2(dy, dx)
+    const hazard = e.power === 2
+    if (!hazard && victim) {
+      // The ball keeps falling into the void after the sim lets go of it.
+      const behind = this.behindAny(e.x, e.y, match)
+      this.add({
+        kind: 'faller', x: e.x, y: e.y, z: victim.fallHeight, vx: Math.cos(ang) * 120, vy: Math.sin(ang) * 120, vz: -260, g: 1400,
+        size: victim.radius, color, life: 1.1, drag: 0.5, spin: (Math.random() - 0.5) * 8, behind,
+        look: { color, skin: victim.skin, pattern: victim.pattern, lookX: 0, lookY: -0.4, expression: 'scared', blink: 0, time: 0 },
+      })
+    }
+    if (!prefs.reducedMotion) this.add({ kind: 'beam', x: e.x, y: e.y, z: 0, size: 1, color, life: 0.9, rot: ang })
+    this.ring(e.x, e.y, '#ffffff', 90, 0.5, 6)
+    this.ring(e.x, e.y, color, 150, 0.8, 10)
+    this.add({ kind: 'sring', x: e.x, y: e.y, z: 10, size: 120, color, life: 0.5, spin: 8 })
+    this.add({ kind: 'flash', x: e.x, y: e.y, z: 10, size: 150, color: '#ffffff', life: 0.18 })
+    const bits = full ? 46 : 12
+    for (let i = 0; i < bits; i++) {
+      const a = ang + (Math.random() - 0.5) * 1.8
+      const s = 220 + Math.random() * 640
+      const c = i % 3 === 0 ? e.color : i % 3 === 1 ? color : '#ffffff'
+      if (i % 2 === 0) this.add({ kind: 'confetti', x: e.x, y: e.y, z: 10, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: 200 + Math.random() * 400, g: 700, size: 3 + Math.random() * 3, color: c, life: 1.2 + Math.random() * 0.6, drag: 2.2, spin: (Math.random() - 0.5) * 14 })
+      else this.add({ kind: 'spark', x: e.x, y: e.y, z: 10, vx: Math.cos(a) * s * 1.3, vy: Math.sin(a) * s * 1.3, vz: Math.random() * 300, g: 500, size: 2.6, color: c, life: 0.45 + Math.random() * 0.3, drag: 2.5 })
+    }
+    const mine = e.victimId === localId
+    this.add({ kind: 'stamp', x: e.x, y: e.y, z: 70, vz: 30, size: local ? 46 : 32, color: mine ? '#ff4d3a' : '#fff7ea', life: 1.15, rot: (Math.random() - 0.5) * 0.3, text: 'KO!' })
+    if (prefs.flashes !== false) {
+      this.flashA = Math.max(this.flashA, (local ? 0.34 : 0.1) * motion)
+      this.flashColor = color
+    }
+    this.trauma = Math.min(1, this.trauma + (local ? 0.6 : 0.24) * shake)
+    if (local) {
+      this.hitstop = Math.max(this.hitstop, 0.13)
+      this.punch = Math.max(this.punch, 0.09 * motion)
+    }
+    if (fx) fx.ghosts = []
+  }
+
+  private onBoom(e: FxEvent, full: boolean, shake: number): void {
+    this.ring(e.x, e.y, e.color, 110, 0.6, 10)
+    this.ring(e.x, e.y, '#ffffff', 60, 0.3, 4)
+    this.add({ kind: 'flash', x: e.x, y: e.y, z: 20, size: 110, color: '#fff1c4', life: 0.18 })
+    this.add({ kind: 'sring', x: e.x, y: e.y, z: 30, size: 90, color: '#ffc14d', life: 0.4, spin: 6 })
+    this.add({ kind: 'scorch', x: e.x, y: e.y, z: 0, size: Math.min(140, e.power * 0.22), color: '#000000', life: 7 })
+    for (let i = 0; i < (full ? 30 : 10); i++) {
+      const a = Math.random() * TAU
+      const s = 140 + Math.random() * 420
+      if (i % 3 === 0) this.add({ kind: 'smoke', x: e.x, y: e.y, z: 10, vx: Math.cos(a) * s * 0.3, vy: Math.sin(a) * s * 0.3, vz: 40 + Math.random() * 80, size: 14 + Math.random() * 16, color: '#2a2234', life: 1 + Math.random() * 0.6, drag: 2 })
+      else if (i % 3 === 1) this.add({ kind: 'spark', x: e.x, y: e.y, z: 10, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: 100 + Math.random() * 400, g: 900, size: 2.6, color: i % 2 ? e.color : '#ffc14d', life: 0.5 + Math.random() * 0.3, drag: 3 })
+      else this.add({ kind: 'chunk', x: e.x, y: e.y, z: 10, vx: Math.cos(a) * s * 0.7, vy: Math.sin(a) * s * 0.7, vz: 260 + Math.random() * 300, g: 1300, size: 3 + Math.random() * 4, color: '#5a4a5e', life: 0.9, drag: 1, spin: (Math.random() - 0.5) * 20 })
+    }
+    this.trauma = Math.min(1, this.trauma + 0.26 * shake)
+  }
+
+  private onAbility(e: FxEvent, match: Match, local: boolean, full: boolean): void {
+    const b = match.bodies.find((x) => x.id === e.actorId)
+    const id = e.text
+    const c = e.color
+    const fx = b ? this.fxFor(b) : null
+    if (id === 'shockwave') {
+      this.ring(e.x, e.y, c, 172, 0.45, 8)
+      this.ring(e.x, e.y, '#ffffff', 120, 0.3, 3)
+      this.add({ kind: 'sring', x: e.x, y: e.y, z: 20, size: 80, color: c, life: 0.3, spin: 5 })
+      for (let i = 0; i < (full ? 20 : 8); i++) {
+        const a = (i / 20) * TAU
+        this.add({ kind: 'puff', x: e.x, y: e.y, z: 3, vx: Math.cos(a) * 380, vy: Math.sin(a) * 380, size: 8, color: '#e6eef8', life: 0.45, drag: 5 })
+      }
+    } else if (id === 'magnet' || id === 'gravity-well') {
+      const R = id === 'magnet' ? 210 : 150
+      this.add({ kind: 'implode', x: e.x, y: e.y, z: 0, size: R, color: id === 'magnet' ? c : '#b388ff', life: 0.5, spin: 4 })
+      for (let i = 0; i < (full ? 18 : 6); i++) {
+        const a = Math.random() * TAU
+        const d = R * (0.7 + Math.random() * 0.3)
+        this.add({ kind: 'spark', x: e.x + Math.cos(a) * d, y: e.y + Math.sin(a) * d, z: 12, vx: -Math.cos(a) * d * 2.2, vy: -Math.sin(a) * d * 2.2, size: 2, color: id === 'magnet' ? c : '#b388ff', life: 0.42, drag: 1 })
+      }
+    } else if (id === 'phase') {
+      this.add({ kind: 'sring', x: e.x, y: e.y, z: 20, size: 46, color: '#cfe8ff', life: 0.4, spin: 3 })
+      for (let i = 0; i < 10; i++) {
+        const a = Math.random() * TAU
+        this.add({ kind: 'star', x: e.x, y: e.y, z: 20, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90, vz: 90, size: 4, color: '#cfe8ff', life: 0.55, drag: 3 })
+      }
+    } else if (id === 'overdrive') {
+      this.ring(e.x, e.y, '#ffc14d', 70, 0.4, 6)
+      for (let i = 0; i < 16; i++) {
+        const a = Math.random() * TAU
+        this.add({ kind: 'ember', x: e.x, y: e.y, z: 14, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120, vz: 160, size: 3, color: i % 2 ? '#ffc14d' : '#ff6a2a', life: 0.6, drag: 3 })
+      }
+    } else if (id === 'anchor') {
+      this.ring(e.x, e.y, '#f4f7fb', 80, 0.45, 9)
+      for (let i = 0; i < (full ? 14 : 5); i++) {
+        const a = Math.random() * TAU
+        this.add({ kind: 'puff', x: e.x, y: e.y, z: 2, vx: Math.cos(a) * 220, vy: Math.sin(a) * 220, size: 9, color: '#cfd9e6', life: 0.5, drag: 5 })
+      }
+      if (fx) {
+        fx.squashAng = Math.PI / 2
+        fx.squashV -= 10
+      }
+    } else if (id === 'repulse' && b) {
+      const m = Math.hypot(b.input.x, b.input.y)
+      const s = Math.hypot(b.vx, b.vy)
+      const a = m > 0.15 ? Math.atan2(b.input.y, b.input.x) : s > 20 ? Math.atan2(b.vy, b.vx) : 0
+      for (let i = 0; i < (full ? 26 : 10); i++) {
+        const aa = a + (Math.random() - 0.5) * 1.1
+        const sp = 300 + Math.random() * 500
+        this.add({ kind: 'spark', x: e.x, y: e.y, z: 18, vx: Math.cos(aa) * sp, vy: Math.sin(aa) * sp, size: 2.4, color: i % 3 ? c : '#ffffff', life: 0.35, drag: 3 })
+      }
+      this.add({ kind: 'streak', x: e.x, y: e.y, z: 18, size: 220, color: c, life: 0.3, rot: a })
+    } else if (id === 'blink' && fx) {
+      this.add({ kind: 'streak', x: fx.lastX, y: fx.lastY, z: 20, x2: e.x, y2: e.y, size: 0, color: c, life: 0.35 })
+      for (const [px, py] of [[fx.lastX, fx.lastY], [e.x, e.y]] as const) {
+        for (let i = 0; i < 8; i++) {
+          const a = Math.random() * TAU
+          this.add({ kind: 'star', x: px, y: py, z: 20, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120, vz: 60, size: 4, color: c, life: 0.4, drag: 3 })
+        }
+      }
+    } else if (id === 'mirror') {
+      this.add({ kind: 'sring', x: e.x, y: e.y, z: 20, size: 40, color: '#7ee0ff', life: 0.35, spin: 4 })
+    } else {
+      this.ring(e.x, e.y, c, 60, 0.45, 5)
+      this.ring(e.x, e.y, '#ffffff', 34, 0.3, 2)
+    }
+    if (local && id) {
+      const def = abilityById(id)
+      if (def.id === id) this.add({ kind: 'text', x: e.x, y: e.y, z: 72, vz: 50, size: 17, color: c, life: 0.85, drag: 2, text: def.name.toUpperCase() })
+    }
+  }
+
+  // ================================================================ frame
 
   /**
    * Draws the match blended `alpha` of the way from the previous tick to the current one, so motion
@@ -376,29 +562,217 @@ export class Renderer {
   }
 
   private drawFrame(match: Match, prefs: RenderPrefs, biasX: number, spectateId: string): void {
+    const ctx = this.ctx
     const w = this.canvas.width
     const h = this.canvas.height
     const now = performance.now()
-    const dt = this.lastNow ? clamp((now - this.lastNow) / 1000, 0, 0.05) : 1 / 60
+    const raw = this.lastNow ? now - this.lastNow : 16
+    const dt = this.lastNow ? clamp(raw / 1000, 0, 0.05) : 1 / 60
     this.lastNow = now
     this.clock += dt
-    if (this.matchRef !== match) {
-      this.matchRef = match
-      this.balls.clear()
-      this.finish = null
+    this.adaptQuality(raw)
+    const menu = match.silent
+    if (this.matchRef !== match) this.enterMatch(match)
+
+    const focus = match.players.find((p) => p.id === spectateId && p.alive) ?? match.players.find((p) => p.alive)
+    this.frameCamera(match, w, h, dt, prefs, biasX, focus, menu, spectateId)
+    const Z = this.Z
+    const OX = this.OX
+    const OY = this.OY
+    const camX = this.camX
+    const camY = this.camY
+    const project: Project = (x, y, z = 0) => ({ x: OX + (x - camX) * Z, y: OY + (y - camY) * Z * TILT - z * Z })
+    this.css = (x, y, z = 0) => {
+      const p = project(x, y, z)
+      return { x: p.x / this.dpr, y: p.y / this.dpr }
     }
 
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.globalAlpha = 1
+    ctx.globalCompositeOperation = 'source-over'
+    this.background(match, w, h, dt)
+
+    const poses = match.arena.solids.map((s) => solidPose(s, match.time, match.shrink))
+    const bodies = match.bodies.filter((b) => b.alive)
+    for (const b of bodies) this.track(b, dt, match, prefs)
+    const sunk = (b: Body) => b.falling && b.fallHeight < -2
+    const behind = bodies.filter((b) => sunk(b) && this.behindFloor(b, poses))
+
+    // Things below and behind the platforms.
+    this.drawParticles(project, dt, prefs, 'behind')
+    for (const b of behind) this.drawBall(b, project, prefs, match)
+
+    const order = [...poses].sort((a, b) => a.y - b.y)
+    for (const pose of order) this.platformUnder(pose, project, match)
+    for (const pose of order) {
+      this.platformSide(pose, project, match)
+      this.platformTop(pose, project, match)
+    }
+
+    // Ground decals.
+    this.drawParticles(project, 0, prefs, 'ground')
+    this.edgeGlow(bodies, project)
+    this.groundHazards(match, project)
+    this.groundEvents(match, project)
+    if (match.zone) this.zone(match, project)
+
+    const front = bodies.filter((b) => !behind.includes(b))
+    for (const b of front) {
+      if (this.fxFor(b).dropDelay > 0) continue
+      const lift = this.zOf(b)
+      this.shadow(b, project, lift)
+      if (match.config.teams && !b.decoy && !b.falling) this.teamRing(b, project, teamColor(b.team))
+    }
+    const you = front.find((b) => b.id === spectateId)
+    if (you && !menu && match.status !== 'countdown') this.localMarker(you, project)
+    for (const b of front) this.trail(b, project)
+
+    // Upright things, painted back to front.
+    const items: DrawItem[] = []
+    for (const b of front) items.push({ y: b.y, draw: () => { this.ghosts(b, project); this.drawBall(b, project, prefs, match) } })
+    this.uprightHazards(match, project, items)
+    for (const wall of wallSegments(match.arena.walls, match.time)) {
+      const my = (wall.y1 + wall.y2) / 2
+      items.push({ y: my, draw: () => this.wall(wall, project, match) })
+    }
+    this.uprightEvents(match, project, items)
+    items.sort((a, b) => a.y - b.y)
+    for (const it of items) it.draw()
+
+    this.drawParticles(project, 0, prefs, 'air')
+
+    // Labels stack upward when they would overlap, using their real widths.
+    this.labelScale = clamp(Math.min(w, h) / this.dpr / 760, 0.82, 1.08)
+    const placed: { x: number; y: number; w: number }[] = []
+    const rowH = 24 * this.dpr * this.labelScale
+    const sorted = [...front].sort((a, b) => a.y - b.y)
+    if (match.status !== 'countdown' || !this.anyDropping()) {
+      for (const b of sorted) {
+        if (b.decoy) continue
+        const fx = this.fxFor(b)
+        if (fx.drop > 0.05) continue
+        const p = project(b.x, b.y, this.zOf(b) + b.radius * 2 + 10)
+        const lw = this.labelWidth(b)
+        let y = p.y
+        for (let guard = 0; guard < 6; guard++) {
+          const hit = placed.some((o) => Math.abs(o.x - p.x) < (o.w + lw) / 2 + 4 * this.dpr && Math.abs(o.y - y) < rowH)
+          if (!hit) break
+          y -= rowH
+        }
+        placed.push({ x: p.x, y, w: lw })
+        this.label(b, p.x, y, b.id === spectateId && !menu, match.config.teams ? teamColor(b.team) : '')
+      }
+    }
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    this.screenFx(match, w, h, dt, prefs, focus, spectateId)
+    if (!menu) this.offscreen(match, project, w, h, spectateId)
+    this.countdown(match, w, h)
+    if (match.replayMode) this.replayTag(w)
+  }
+
+  private replayTag(w: number): void {
+    const ctx = this.ctx
     const dpr = this.dpr
-    const focus = match.players.find((p) => p.id === spectateId && p.alive) ?? match.players.find((p) => p.alive)
+    ctx.save()
+    const x = w / 2
+    const y = 34 * dpr
+    ctx.font = `${22 * dpr}px ${DISPLAY_FONT}`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    const tw = ctx.measureText('REPLAY').width + 44 * dpr
+    roundRect(ctx, x - tw / 2, y - 17 * dpr, tw, 34 * dpr, 17 * dpr)
+    ctx.fillStyle = 'rgba(8,10,24,0.85)'
+    ctx.fill()
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)'
+    ctx.lineWidth = 1.5 * dpr
+    ctx.stroke()
+    ctx.beginPath()
+    ctx.arc(x - tw / 2 + 18 * dpr, y, 5 * dpr, 0, TAU)
+    ctx.fillStyle = Math.sin(this.clock * 6) > 0 ? '#ff4d3a' : 'rgba(255,77,58,0.3)'
+    ctx.fill()
+    ctx.fillStyle = '#ffffff'
+    ctx.fillText('REPLAY', x + 8 * dpr, y + 1 * dpr)
+    ctx.restore()
+  }
+
+  /** Drops resolution a step at a time when the device cannot keep up. */
+  private adaptQuality(frameMs: number): void {
+    if (frameMs > 250) return
+    this.frameEma = lerp(this.frameEma, frameMs, 0.05)
+    this.slowFrames = this.frameEma > 21 ? this.slowFrames + 1 : Math.max(0, this.slowFrames - 2)
+    if (this.slowFrames > 120 && this.dpr > 1) {
+      this.slowFrames = 0
+      this.dprCap = Math.max(1, this.dpr - 0.25)
+      this.resize()
+    }
+  }
+
+  private enterMatch(match: Match): void {
+    this.matchRef = match
+    this.balls.clear()
+    this.particles = []
+    this.finish = null
+    this.bgCache = null
+    // Start a little wide so the camera settles in during the countdown.
+    this.camZoom = 0
+    if (match.status === 'countdown' && !match.silent) {
+      match.players.forEach((p, i) => {
+        const fx = this.fxFor(p)
+        fx.drop = 1
+        fx.dropDelay = 0.25 + i * 0.13
+      })
+    }
+  }
+
+  private anyDropping(): boolean {
+    for (const fx of this.balls.values()) if (fx.drop > 0.05) return true
+    return false
+  }
+
+  private frameCamera(match: Match, w: number, h: number, dt: number, prefs: RenderPrefs, biasX: number, focus: Body | undefined, menu: boolean, localId: string): void {
+    const dpr = this.dpr
+    const view = match.arena.view
     // Portrait phones would fit the arena to the narrow side and waste most of the screen.
     // Zoom in and let the camera follow the local ball further instead.
     const tall = clamp((h / Math.max(1, w) - 1.05) / 0.9, 0, 1)
-    const reach = match.arena.view * 0.42 * tall
+    const fitW = w / (2 * view * 1.02)
+    const fitH = h / ((2 * view * TILT + DEPTH * 1.2) * 1.02)
+    const base = Math.min(fitW, fitH) * (1 + tall * 0.5) * (menu ? 0.94 : 1)
+
     let tx = 0
     let ty = 0
-    if (focus) {
-      tx = clamp(focus.x + focus.vx * 0.06, -70 - reach * 0.6, 70 + reach * 0.6)
-      ty = clamp(focus.y + focus.vy * 0.06, -50 - reach, 50 + reach)
+    let zoomK = 1
+    const alive = match.players.filter((p) => p.alive)
+    if (!menu && alive.length > 0 && match.status !== 'countdown') {
+      let minX = Infinity
+      let maxX = -Infinity
+      let minY = Infinity
+      let maxY = -Infinity
+      for (const p of alive) {
+        const px = p.x + p.vx * 0.2
+        const py = p.y + p.vy * 0.2
+        minX = Math.min(minX, px)
+        maxX = Math.max(maxX, px)
+        minY = Math.min(minY, py)
+        maxY = Math.max(maxY, py)
+      }
+      const pad = 250
+      const halfW = (maxX - minX) / 2 + pad
+      const halfH = ((maxY - minY) / 2 + pad) * TILT + 60
+      const fit = Math.min(w / 2 / (halfW * base), h / 2 / (halfH * base))
+      zoomK = clamp(fit, 1, alive.length <= 2 ? 1.35 : 1.15)
+      const k = clamp((zoomK - 1) / 0.3, 0, 1) * 0.85
+      tx = lerp(0, (minX + maxX) / 2, k)
+      ty = lerp(0, (minY + maxY) / 2, k)
+    }
+    if (focus && !menu) {
+      const reach = view * 0.42 * tall
+      const lx = clamp(focus.x + focus.vx * 0.08, -60 - reach * 0.6, 60 + reach * 0.6)
+      const ly = clamp(focus.y + focus.vy * 0.08, -40 - reach, 40 + reach)
+      const pull = focus.id === localId ? 0.16 + tall * 0.6 : 0.1
+      tx = lerp(tx, lx, pull)
+      ty = lerp(ty, ly, pull)
     }
     let finishZoom = 0
     if (this.finish) {
@@ -407,19 +781,20 @@ export class Renderer {
       const env = Math.sin(u * Math.PI)
       tx = lerp(tx, this.finish.x, env)
       ty = lerp(ty, this.finish.y, env)
-      finishZoom = env * 0.45 * (prefs.reducedMotion ? 0.2 : 1)
+      finishZoom = env * 0.55 * (prefs.reducedMotion ? 0.2 : 1)
       if (this.finish.life <= 0) this.finish = null
     }
-    const follow = 1 - Math.exp(-4 * dt)
+    const follow = 1 - Math.exp(-3.2 * dt)
     this.camX = lerp(this.camX, tx, follow)
     this.camY = lerp(this.camY, ty, follow)
     this.punch *= Math.exp(-9 * dt)
-    const baseZoom = (Math.min(w, h) / (match.arena.view * 2 * 1.12)) * (1 + tall * 0.42)
-    this.camZoom = lerp(this.camZoom, 1 + finishZoom, 1 - Math.exp(-7 * dt))
-    const zoom = baseZoom * (this.camZoom + this.punch)
+    const targetZoom = zoomK * (1 + finishZoom)
+    if (this.camZoom <= 0) this.camZoom = menu ? targetZoom : targetZoom * 0.82
+    this.camZoom = lerp(this.camZoom, targetZoom, 1 - Math.exp(-(match.status === 'countdown' ? 1.6 : 2.4) * dt))
+    const Z = base * (this.camZoom + this.punch)
 
     this.trauma = Math.max(0, this.trauma - dt * 1.5)
-    const quake = this.trauma * this.trauma * 16 * dpr
+    const quake = this.trauma * this.trauma * 18 * dpr
     const t = this.clock * 26
     const sx = quake * (Math.sin(t * 1.1) * 0.6 + Math.sin(t * 2.3 + 1.7) * 0.4)
     const sy = quake * (Math.cos(t * 0.9 + 0.4) * 0.6 + Math.sin(t * 2.7 + 3.1) * 0.4)
@@ -428,115 +803,158 @@ export class Renderer {
     this.kickX += this.kickVX * dt
     this.kickY += this.kickVY * dt
 
-    const originX = w / 2 + biasX * dpr + sx + this.kickX * dpr
-    // On tall screens the controls cover the bottom, so the play view sits a little higher.
-    const originY = h / 2 - tall * h * 0.06 + sy + this.kickY * dpr
-    const camX = this.camX
-    const camY = this.camY
-    const project: Project = (x, y) => ({
-      x: originX + (x - camX) * zoom,
-      y: originY + (y - camY) * zoom,
-    })
-    this.css = (x, y) => {
-      const p = project(x, y)
-      return { x: p.x / dpr, y: p.y / dpr }
-    }
-
-    this.background(match, w, h)
-
-    const poses = match.arena.solids.map((s) => solidPose(s, match.time, match.shrink))
-    const bodies = match.bodies.filter((b) => b.alive)
-    for (const b of bodies) this.track(b, dt)
-    const sunk = (b: Body) => b.falling && b.fallHeight < -2
-    const behind = bodies.filter((b) => sunk(b) && this.behindFloor(b, poses))
-
-    for (const b of behind) this.drawBall(b, project, zoom, prefs)
-
-    const depth = 16 * dpr * (zoom / baseZoom)
-    for (const pose of poses) this.floorSide(pose, project, zoom, depth, match.arena.floor, match.arena.rim)
-    for (const pose of poses) this.floorTop(pose, project, zoom, match)
-    this.edgeGlow(bodies, project, zoom)
-
-    this.hazards(match, project, zoom)
-    this.events(match, project, zoom)
-    if (match.zone) this.zone(match, project, zoom)
-    this.walls(match, project)
-
-    const front = bodies.filter((b) => !behind.includes(b))
-    for (const b of front) this.trail(b, project, zoom)
-    for (const b of front) this.ghosts(b, project, zoom)
-    for (const b of front) {
-      const p = project(b.x, b.y)
-      const lift = Math.max(0, b.falling ? b.fallHeight : b.height) * zoom * 0.85
-      this.shadow(p.x, p.y, b.radius * zoom * (b.falling ? 0.7 : 1), lift)
-      if (match.config.teams && !b.decoy && !b.falling) this.teamRing(p.x, p.y, b.radius * zoom, teamColor(b.team))
-    }
-    const sorted = [...front].sort((a, b) => a.y - b.y)
-    for (const b of sorted) this.drawBall(b, project, zoom, prefs)
-
-    this.drawParticles(project, zoom, dt, prefs)
-
-    // Labels stack upward when they would overlap, using their real widths.
-    this.labelScale = clamp(Math.min(w, h) / dpr / 720, 0.8, 1)
-    const placed: { x: number; y: number; w: number }[] = []
-    const rowH = 21 * dpr * this.labelScale
-    for (const b of sorted) {
-      if (b.decoy) continue
-      const p = project(b.x, b.y)
-      const lw = this.labelWidth(b)
-      let y = p.y - Math.max(0, b.height) * zoom * 0.85
-      for (let guard = 0; guard < 6; guard++) {
-        const hit = placed.some((o) => Math.abs(o.x - p.x) < (o.w + lw) / 2 + 4 * dpr && Math.abs(o.y - y) < rowH)
-        if (!hit) break
-        y -= rowH
-      }
-      placed.push({ x: p.x, y, w: lw })
-      this.label(b, p.x, y, zoom, b.id === spectateId && !match.silent, match.config.teams ? teamColor(b.team) : '')
-    }
-
-    this.screenFx(match, w, h, dt, prefs, focus, spectateId)
-    this.offscreen(match, project, w, h, spectateId)
-    this.countdown(match, w, h)
+    this.Z = Z
+    this.OX = w / 2 + biasX * dpr + sx + this.kickX * dpr
+    this.OY = h / 2 - tall * h * 0.05 - DEPTH * Z * 0.45 + sy + this.kickY * dpr
   }
 
-  // ---------------------------------------------------------------- world
+  // ================================================================ background
 
-  private background(match: Match, w: number, h: number): void {
+  private background(match: Match, w: number, h: number, dt: number): void {
     const ctx = this.ctx
-    const accent = match.arena.accent
-    const rim = match.arena.rim
-    const bg = ctx.createRadialGradient(w / 2, h * 0.45, 20, w / 2, h / 2, Math.max(w, h) * 0.75)
-    bg.addColorStop(0, mixHex('#0f1b2b', rim, 0.1))
-    bg.addColorStop(0.5, '#0a111b')
-    bg.addColorStop(1, '#04070c')
-    ctx.fillStyle = bg
-    ctx.fillRect(0, 0, w, h)
+    const key = `${match.arena.id}:${w}x${h}`
+    if (!this.bgCache || this.bgCache.key !== key) this.bgCache = { key, canvas: this.paintSky(match, w, h) }
+    const sky = this.bgCache.canvas
+    const px = -this.camX * 0.05 * this.Z
+    const py = -this.camY * 0.05 * this.Z
+    ctx.drawImage(sky, -w * 0.05 + px, -h * 0.05 + py)
 
+    // Distant islands drift far below the arena.
+    const T = this.clock
+    for (const r of this.rocks) {
+      const x = w / 2 + (r.x * w * 0.5) - this.camX * r.depth * this.Z * 0.6 + Math.sin(T * 0.05 + r.seed) * 20 * this.dpr
+      const y = r.y * h + Math.sin(T * 0.3 + r.seed * 2) * 6 * this.dpr - this.camY * r.depth * this.Z * 0.4
+      this.rock(x, y, r.r * this.dpr * (0.6 + r.depth), r.seed, match.arena.rim, r.depth)
+    }
+
+    // Motes rising through the void give the empty space some air.
     ctx.save()
     ctx.globalCompositeOperation = 'lighter'
-    const blobs: [number, number, string, number][] = [
-      [0.18 + Math.sin(this.clock * 0.05) * 0.04, 0.22, rim, 0.07],
-      [0.82, 0.78 + Math.cos(this.clock * 0.04) * 0.05, accent, 0.06],
-    ]
-    for (const [bx, by, c, a] of blobs) {
-      const cx = bx * w - this.camX * 0.2 * this.dpr
-      const cy = by * h - this.camY * 0.2 * this.dpr
-      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h) * 0.45)
-      g.addColorStop(0, hexA(c, a))
-      g.addColorStop(1, hexA(c, 0))
-      ctx.fillStyle = g
-      ctx.fillRect(0, 0, w, h)
+    for (const m of this.motes) {
+      m.y -= m.s * 0.02 * dt * m.z
+      if (m.y < -0.05) m.y = 1.05
+      const x = ((m.x * w - this.camX * m.z * this.Z * 0.3) % w + w) % w
+      const y = m.y * h - this.camY * m.z * this.Z * 0.2
+      const a = 0.25 + Math.sin(T * 2 + m.x * 30) * 0.15
+      ctx.fillStyle = hexA(m.z > 0.6 ? match.arena.accent : '#cfe2ff', a * m.z)
+      ctx.beginPath()
+      ctx.arc(x, y, m.r * this.dpr * m.z, 0, TAU)
+      ctx.fill()
     }
     ctx.restore()
-
-    for (const s of this.stars) {
-      const px = (((s.x * w - this.camX * s.depth * this.dpr * 0.6) % w) + w) % w
-      const py = (((s.y * h - this.camY * s.depth * this.dpr * 0.6) % h) + h) % h
-      const tw = 0.6 + Math.sin(this.clock * s.tw + s.x * 40) * 0.4
-      ctx.fillStyle = `rgba(210,228,255,${s.a * tw})`
-      ctx.fillRect(px, py, s.r * this.dpr, s.r * this.dpr)
-    }
   }
+
+  private paintSky(match: Match, w: number, h: number): HTMLCanvasElement {
+    const c = document.createElement('canvas')
+    c.width = Math.ceil(w * 1.1)
+    c.height = Math.ceil(h * 1.1)
+    const g = c.getContext('2d')!
+    const { rim, accent, floor } = match.arena
+    const W = c.width
+    const H = c.height
+    const sky = g.createLinearGradient(0, 0, 0, H)
+    sky.addColorStop(0, mixHex('#050816', accent, 0.07))
+    sky.addColorStop(0.5, mixHex('#080c1d', floor, 0.25))
+    sky.addColorStop(1, mixHex('#03040b', rim, 0.08))
+    g.fillStyle = sky
+    g.fillRect(0, 0, W, H)
+    g.globalCompositeOperation = 'lighter'
+    const blobs: [number, number, number, string, number][] = [
+      [0.15, 0.2, 0.55, rim, 0.13],
+      [0.85, 0.75, 0.6, accent, 0.1],
+      [0.7, 0.1, 0.4, mixHex(rim, accent, 0.5), 0.08],
+      [0.3, 0.9, 0.5, floor, 0.25],
+    ]
+    for (const [bx, by, br, col, a] of blobs) {
+      const rad = Math.max(W, H) * br
+      const gr = g.createRadialGradient(bx * W, by * H, 0, bx * W, by * H, rad)
+      gr.addColorStop(0, hexA(col, a))
+      gr.addColorStop(0.5, hexA(col, a * 0.35))
+      gr.addColorStop(1, hexA(col, 0))
+      g.fillStyle = gr
+      g.fillRect(0, 0, W, H)
+    }
+    // Soft light shafts from above.
+    g.filter = 'blur(24px)'
+    for (let i = 0; i < 4; i++) {
+      const x = W * (0.1 + hashN(i * 7.7) * 0.8)
+      const sw = W * (0.06 + hashN(i * 3.1) * 0.08)
+      const shaft = g.createLinearGradient(0, 0, 0, H * 0.8)
+      shaft.addColorStop(0, hexA('#cfe2ff', 0.022))
+      shaft.addColorStop(1, hexA('#cfe2ff', 0))
+      g.fillStyle = shaft
+      g.beginPath()
+      g.moveTo(x, 0)
+      g.lineTo(x + sw, 0)
+      g.lineTo(x + sw * 3 + W * 0.1, H * 0.8)
+      g.lineTo(x + W * 0.1, H * 0.8)
+      g.closePath()
+      g.fill()
+    }
+    g.filter = 'none'
+    for (let i = 0; i < 260; i++) {
+      const x = hashN(i * 3 + 1) * W
+      const y = hashN(i * 3 + 2) * H
+      const r = (0.4 + hashN(i * 3 + 3) * 1.4) * this.dpr
+      g.fillStyle = `rgba(220,232,255,${0.15 + hashN(i * 7) * 0.55})`
+      g.beginPath()
+      g.arc(x, y, r, 0, TAU)
+      g.fill()
+      if (hashN(i * 11) > 0.96) {
+        const glow = g.createRadialGradient(x, y, 0, x, y, r * 8)
+        glow.addColorStop(0, 'rgba(220,232,255,0.35)')
+        glow.addColorStop(1, 'rgba(220,232,255,0)')
+        g.fillStyle = glow
+        g.fillRect(x - r * 8, y - r * 8, r * 16, r * 16)
+      }
+    }
+    g.globalCompositeOperation = 'source-over'
+    const vig = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75)
+    vig.addColorStop(0, 'rgba(0,0,0,0)')
+    vig.addColorStop(1, 'rgba(0,0,0,0.55)')
+    g.fillStyle = vig
+    g.fillRect(0, 0, W, H)
+    return c
+  }
+
+  /** A small floating island far below: flat lit top, jagged rocky underside. */
+  private rock(x: number, y: number, r: number, seed: number, rim: string, depth: number): void {
+    const ctx = this.ctx
+    const rx = r * 1.25
+    const ry = r * 0.3
+    ctx.save()
+    ctx.globalAlpha = 0.3 + depth * 1.2
+    ctx.beginPath()
+    ctx.ellipse(x, y, rx, ry, 0, Math.PI, TAU)
+    const n = 9
+    for (let i = 0; i <= n; i++) {
+      const u = i / n
+      const px = x + rx - u * rx * 2
+      const taper = Math.sin(u * Math.PI)
+      const drop = ry + taper * r * (0.5 + hashN(seed * 13 + i) * 0.9)
+      ctx.lineTo(px, y + drop)
+    }
+    ctx.closePath()
+    const g = ctx.createLinearGradient(0, y - ry, 0, y + r * 1.4)
+    g.addColorStop(0, '#1e2742')
+    g.addColorStop(0.4, '#10162a')
+    g.addColorStop(1, '#04060d')
+    ctx.fillStyle = g
+    ctx.fill()
+    ctx.beginPath()
+    ctx.ellipse(x, y, rx, ry, 0, 0, TAU)
+    const top = ctx.createLinearGradient(0, y - ry, 0, y + ry)
+    top.addColorStop(0, '#2c3a5c')
+    top.addColorStop(1, '#18203a')
+    ctx.fillStyle = top
+    ctx.fill()
+    ctx.strokeStyle = hexA(rim, 0.4)
+    ctx.lineWidth = 1.5 * this.dpr
+    ctx.stroke()
+    ctx.restore()
+  }
+
+  // ================================================================ platforms
 
   private behindFloor(b: Body, poses: Pose[]): boolean {
     let best: Pose | null = null
@@ -551,406 +969,602 @@ export class Renderer {
     return !!best && b.y < best.y
   }
 
-  private floorSide(pose: Pose, project: Project, zoom: number, depth: number, floor: string, rim: string): void {
+  private behindAny(x: number, y: number, match: Match): boolean {
+    const poses = match.arena.solids.map((s) => solidPose(s, match.time, match.shrink))
+    let best: Pose | null = null
+    let bestD = Infinity
+    for (const p of poses) {
+      const d = Math.hypot(x - p.x, y - p.y)
+      if (d < bestD) {
+        bestD = d
+        best = p
+      }
+    }
+    return !!best && y < best.y
+  }
+
+  private poseAlpha(pose: Pose): number {
+    if (!pose.active) return 0
+    if (pose.warn) return 0.65 + Math.sin(this.clock * 22) * 0.3
+    return 1
+  }
+
+  private poseShake(pose: Pose): number {
+    return pose.warn ? Math.sin(this.clock * 60) * 2.5 * this.dpr : 0
+  }
+
+  private platformUnder(pose: Pose, project: Project, match: Match): void {
+    if (!pose.active) return
     const ctx = this.ctx
-    const c = project(pose.x, pose.y)
+    const Z = this.Z
+    const c = project(pose.x, pose.y, -DEPTH)
+    const span = pose.shape === 'poly' ? polyRadius(pose) : pose.r
+    const rx = span * Z * 1.1
+    const ry = span * Z * TILT * 0.9
     ctx.save()
-    ctx.globalAlpha = pose.active ? 1 : 0.15
-    if (pose.warn) ctx.globalAlpha = 0.5 + Math.sin(this.clock * 18) * 0.25
-    const side = ctx.createLinearGradient(0, c.y, 0, c.y + (pose.r || 300) * zoom + depth)
-    side.addColorStop(0, mixHex(floor, '#000000', 0.45))
-    side.addColorStop(1, mixHex(floor, '#000000', 0.75))
-    ctx.fillStyle = side
+    ctx.globalCompositeOperation = 'lighter'
+    const g = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, rx)
+    g.addColorStop(0, hexA(match.arena.rim, 0.22))
+    g.addColorStop(0.5, hexA(match.arena.rim, 0.07))
+    g.addColorStop(1, hexA(match.arena.rim, 0))
+    ctx.fillStyle = g
+    ctx.beginPath()
+    ctx.ellipse(c.x, c.y + ry * 0.2, rx, ry, 0, 0, TAU)
+    ctx.fill()
+    ctx.restore()
+  }
+
+  private platformSide(pose: Pose, project: Project, match: Match): void {
+    const a = this.poseAlpha(pose)
+    if (a <= 0) {
+      this.ghostPlatform(pose, project, match)
+      return
+    }
+    const ctx = this.ctx
+    const Z = this.Z
+    const D = DEPTH * Z
+    const { floor, rim } = match.arena
+    const sx = this.poseShake(pose)
+    ctx.save()
+    ctx.globalAlpha = a
+    ctx.translate(sx, 0)
+    const c = project(pose.x, pose.y)
     if (pose.shape === 'poly') {
-      const pts = pose.points.map((pt) => project(pt.x, pt.y))
-      ctx.beginPath()
-      pts.forEach((s, i) => (i ? ctx.lineTo(s.x, s.y + depth) : ctx.moveTo(s.x, s.y + depth)))
-      ctx.closePath()
-      ctx.fill()
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i]!
-        const b = pts[(i + 1) % pts.length]!
+      const pts = pose.points.map((p) => project(p.x, p.y))
+      const n = pts.length
+      // Signed area tells winding, so outward normals are right for either order.
+      let area = 0
+      for (let i = 0; i < n; i++) {
+        const p = pts[i]!
+        const q = pts[(i + 1) % n]!
+        area += p.x * q.y - q.x * p.y
+      }
+      const sgn = area > 0 ? 1 : -1
+      for (let i = 0; i < n; i++) {
+        const p = pts[i]!
+        const q = pts[(i + 1) % n]!
+        // Screen y points down, so a camera-facing edge has its outward normal pointing +y.
+        const ny = (p.x - q.x) * sgn
+        if (ny <= 0) continue
+        const g = ctx.createLinearGradient(0, Math.min(p.y, q.y), 0, Math.max(p.y, q.y) + D)
+        g.addColorStop(0, shade(floor, -0.3))
+        g.addColorStop(1, shade(floor, -0.82))
+        ctx.fillStyle = g
         ctx.beginPath()
-        ctx.moveTo(a.x, a.y)
-        ctx.lineTo(b.x, b.y)
-        ctx.lineTo(b.x, b.y + depth)
-        ctx.lineTo(a.x, a.y + depth)
+        ctx.moveTo(p.x, p.y)
+        ctx.lineTo(q.x, q.y)
+        ctx.lineTo(q.x, q.y + D)
+        ctx.lineTo(p.x, p.y + D)
         ctx.closePath()
         ctx.fill()
+        ctx.strokeStyle = hexA(rim, 0.65)
+        ctx.lineWidth = 2 * this.dpr
+        ctx.beginPath()
+        ctx.moveTo(p.x, p.y + D * 0.42)
+        ctx.lineTo(q.x, q.y + D * 0.42)
+        ctx.stroke()
       }
     } else {
-      const r = pose.r * zoom
+      const rx = pose.r * Z
+      const ry = pose.r * Z * TILT
+      const g = ctx.createLinearGradient(0, c.y, 0, c.y + ry + D)
+      g.addColorStop(0, shade(floor, -0.25))
+      g.addColorStop(0.6, shade(floor, -0.62))
+      g.addColorStop(1, shade(floor, -0.88))
+      ctx.fillStyle = g
       ctx.beginPath()
-      ctx.arc(c.x, c.y + depth, r, 0, Math.PI)
-      ctx.lineTo(c.x - r, c.y)
-      ctx.arc(c.x, c.y, r, Math.PI, 0, true)
+      ctx.ellipse(c.x, c.y, rx, ry, 0, 0, Math.PI)
+      ctx.lineTo(c.x - rx, c.y + D)
+      ctx.ellipse(c.x, c.y + D, rx, ry, 0, Math.PI, 0, true)
       ctx.closePath()
       ctx.fill()
-      ctx.strokeStyle = hexA(rim, 0.35)
+      // Panel seams wrap the side so it reads as a solid drum.
+      ctx.strokeStyle = 'rgba(0,0,0,0.28)'
       ctx.lineWidth = 1.5 * this.dpr
+      const seams = 18
+      for (let i = 1; i < seams; i++) {
+        const t = (i / seams) * Math.PI
+        const x = c.x + Math.cos(t) * rx
+        const y = c.y + Math.sin(t) * ry
+        ctx.beginPath()
+        ctx.moveTo(x, y)
+        ctx.lineTo(x, y + D)
+        ctx.stroke()
+      }
+      // Emissive band, brighter in the final phase.
+      const hot = match.finalPhase || match.status === 'sudden'
+      const band = hot ? mixHex(rim, '#ff3b2f', 0.5 + Math.sin(this.clock * 8) * 0.3) : rim
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.strokeStyle = hexA(band, 0.35)
+      ctx.lineWidth = 7 * this.dpr
       ctx.beginPath()
-      ctx.arc(c.x, c.y + depth, r, 0, Math.PI)
+      ctx.ellipse(c.x, c.y + D * 0.42, rx, ry, 0, 0.05, Math.PI - 0.05)
+      ctx.stroke()
+      ctx.strokeStyle = hexA(mixHex(band, '#ffffff', 0.4), 0.9)
+      ctx.lineWidth = 2 * this.dpr
+      ctx.stroke()
+      // Running lights travel along the band.
+      for (let i = 0; i < 12; i++) {
+        const t = ((i / 12 + this.clock * 0.05) % 1) * Math.PI
+        const lx = c.x + Math.cos(t) * rx
+        const ly = c.y + D * 0.42 + Math.sin(t) * ry
+        const lg = ctx.createRadialGradient(lx, ly, 0, lx, ly, 9 * this.dpr)
+        lg.addColorStop(0, hexA('#ffffff', 0.8 * Math.sin(t)))
+        lg.addColorStop(1, hexA(band, 0))
+        ctx.fillStyle = lg
+        ctx.fillRect(lx - 9 * this.dpr, ly - 9 * this.dpr, 18 * this.dpr, 18 * this.dpr)
+      }
+      ctx.restore()
+      ctx.strokeStyle = 'rgba(0,0,0,0.5)'
+      ctx.lineWidth = 2 * this.dpr
+      ctx.beginPath()
+      ctx.ellipse(c.x, c.y + D, rx, ry, 0, 0, Math.PI)
       ctx.stroke()
     }
     ctx.restore()
   }
 
-  private floorTop(pose: Pose, project: Project, zoom: number, match: Match): void {
+  private ghostPlatform(pose: Pose, project: Project, match: Match): void {
     const ctx = this.ctx
+    const c = project(pose.x, pose.y)
+    ctx.save()
+    ctx.setLineDash([8 * this.dpr, 8 * this.dpr])
+    ctx.lineDashOffset = -this.clock * 20 * this.dpr
+    ctx.strokeStyle = hexA(match.arena.rim, 0.35)
+    ctx.lineWidth = 2 * this.dpr
+    ctx.beginPath()
+    if (pose.shape === 'poly') this.polyPath(pose, project)
+    else ctx.ellipse(c.x, c.y, pose.r * this.Z, pose.r * this.Z * TILT, 0, 0, TAU)
+    ctx.stroke()
+    ctx.restore()
+  }
+
+  private polyPath(pose: Pose, project: Project): void {
+    const ctx = this.ctx
+    pose.points.forEach((pt, i) => {
+      const s = project(pt.x, pt.y)
+      if (i === 0) ctx.moveTo(s.x, s.y)
+      else ctx.lineTo(s.x, s.y)
+    })
+    ctx.closePath()
+  }
+
+  private platformTop(pose: Pose, project: Project, match: Match): void {
+    const a = this.poseAlpha(pose)
+    if (a <= 0) return
+    const ctx = this.ctx
+    const Z = this.Z
     const { floor, rim, accent, id: arenaId } = match.arena
     const c = project(pose.x, pose.y)
-    const r = pose.r * zoom
+    const rx = pose.r * Z
+    const ry = pose.r * Z * TILT
     ctx.save()
-    ctx.globalAlpha = pose.active ? 1 : 0.16
-    if (pose.warn) ctx.globalAlpha = 0.5 + Math.sin(this.clock * 18) * 0.25
+    ctx.globalAlpha = a
+    ctx.translate(this.poseShake(pose), 0)
 
     const path = () => {
       ctx.beginPath()
-      if (pose.shape === 'poly') {
-        pose.points.forEach((pt, i) => {
-          const s = project(pt.x, pt.y)
-          if (i === 0) ctx.moveTo(s.x, s.y)
-          else ctx.lineTo(s.x, s.y)
-        })
-        ctx.closePath()
-      } else {
-        ctx.arc(c.x, c.y, r, 0, TAU)
+      if (pose.shape === 'poly') this.polyPath(pose, project)
+      else {
+        ctx.ellipse(c.x, c.y, rx, ry, 0, 0, TAU)
         if (pose.shape === 'ring') {
-          ctx.moveTo(c.x + pose.inner * zoom, c.y)
-          ctx.arc(c.x, c.y, pose.inner * zoom, 0, TAU, true)
+          ctx.moveTo(c.x + pose.inner * Z, c.y)
+          ctx.ellipse(c.x, c.y, pose.inner * Z, pose.inner * Z * TILT, 0, 0, TAU, true)
         }
       }
     }
 
-    const span = pose.shape === 'poly' ? 520 * zoom : r
-    const g = ctx.createRadialGradient(c.x, c.y - span * 0.3, span * 0.05, c.x, c.y, span * 1.05)
-    const surfaceTint = pose.surface === 'rubber' ? '#ff6b9a' : pose.surface === 'ice' ? '#bfe8ff' : pose.surface === 'launch' ? '#ffc14d' : floor
-    const top = pose.surface === 'normal' ? floor : mixHex(floor, surfaceTint, 0.12)
-    g.addColorStop(0, mixHex(top, '#ffffff', 0.12))
-    g.addColorStop(0.7, top)
-    g.addColorStop(1, mixHex(top, '#000000', 0.3))
+    const span = (pose.shape === 'poly' ? polyRadius(pose) : pose.r) * Z
+    const surfaceTint = pose.surface === 'rubber' ? '#ff6b9a' : pose.surface === 'ice' ? '#bfe8ff' : pose.surface === 'launch' ? '#ffc14d' : pose.surface === 'sticky' ? '#9b7bff' : floor
+    const top = pose.surface === 'normal' ? floor : mixHex(floor, surfaceTint, 0.14)
+    const g = ctx.createRadialGradient(c.x - span * 0.2, c.y - span * TILT * 0.45, span * 0.05, c.x, c.y, span * 1.1)
+    g.addColorStop(0, shade(top, 0.2))
+    g.addColorStop(0.55, top)
+    g.addColorStop(1, shade(top, -0.35))
     path()
     ctx.fillStyle = g
     ctx.fill('evenodd')
 
-    // Grid: reads motion, as in slither.io. The pattern follows the world.
-    const pattern = this.gridPattern()
+    // Tile pattern follows the world so motion reads across the floor.
+    ctx.save()
+    path()
+    ctx.clip('evenodd')
+    const pattern = this.hexTile()
     if (pattern) {
       const o = project(0, 0)
-      const scale = zoom * 1.4
-      pattern.setTransform(new DOMMatrix([scale, 0, 0, scale, o.x, o.y]))
-      ctx.save()
-      path()
-      ctx.clip('evenodd')
-      ctx.globalAlpha *= 0.55
+      const scale = Z * 1.3
+      pattern.setTransform(new DOMMatrix([scale, 0, 0, scale * TILT, o.x, o.y]))
+      ctx.globalAlpha *= 0.6
       ctx.fillStyle = pattern
-      ctx.fillRect(c.x - span * 1.4, c.y - span * 1.4, span * 2.8, span * 2.8)
-      ctx.restore()
+      ctx.fillRect(c.x - span * 1.3, c.y - span * 1.3, span * 2.6, span * 2.6)
+      ctx.globalAlpha = a
     }
+    // Light pooling in the centre and a soft falloff toward the edge.
+    const pool = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, span)
+    pool.addColorStop(0, hexA(accent, 0.1))
+    pool.addColorStop(1, hexA(accent, 0))
+    ctx.fillStyle = pool
+    ctx.globalCompositeOperation = 'lighter'
+    ctx.fillRect(c.x - span, c.y - span, span * 2, span * 2)
+    ctx.globalCompositeOperation = 'source-over'
 
-    if ((arenaId === 'classic' || arenaId === 'collapse') && pose.shape === 'circle') {
-      ctx.save()
-      ctx.globalAlpha *= 0.3
-      ctx.strokeStyle = accent
-      ctx.lineWidth = 1.5 * this.dpr
-      for (const ring of [0.33, 0.66]) {
+    if (pose.shape === 'circle' && pose.r > 200) {
+      // Court markings.
+      ctx.strokeStyle = hexA(accent, 0.22)
+      ctx.lineWidth = 2 * this.dpr
+      for (const ring of arenaId === 'classic' || arenaId === 'collapse' ? [0.33, 0.66] : [0.22]) {
         ctx.beginPath()
-        ctx.arc(c.x, c.y, r * ring, 0, TAU)
+        ctx.ellipse(c.x, c.y, rx * ring, ry * ring, 0, 0, TAU)
         ctx.stroke()
       }
-      ctx.restore()
+      ctx.beginPath()
+      ctx.moveTo(c.x - rx * 0.06, c.y)
+      ctx.lineTo(c.x + rx * 0.06, c.y)
+      ctx.moveTo(c.x, c.y - ry * 0.06)
+      ctx.lineTo(c.x, c.y + ry * 0.06)
+      ctx.stroke()
     }
     if (pose.surface === 'launch') {
-      ctx.save()
-      ctx.strokeStyle = hexA('#ffc14d', 0.5)
-      ctx.lineWidth = 2 * this.dpr
-      ctx.setLineDash([8 * this.dpr, 8 * this.dpr])
-      ctx.lineDashOffset = -this.clock * 30 * this.dpr
+      ctx.strokeStyle = hexA('#ffc14d', 0.6)
+      ctx.lineWidth = 3 * this.dpr
+      ctx.setLineDash([10 * this.dpr, 10 * this.dpr])
+      ctx.lineDashOffset = -this.clock * 40 * this.dpr
       ctx.beginPath()
-      ctx.arc(c.x, c.y, r * 0.7, 0, TAU)
+      ctx.ellipse(c.x, c.y, rx * 0.7, ry * 0.7, 0, 0, TAU)
       ctx.stroke()
+      ctx.setLineDash([])
+    }
+    if (pose.surface === 'rubber') {
+      ctx.fillStyle = hexA('#ff9fc0', 0.08)
+      for (let i = 0; i < 40; i++) {
+        const t = hashN(i * 3.3) * TAU
+        const d = Math.sqrt(hashN(i * 5.1)) * 0.9
+        ctx.beginPath()
+        ctx.ellipse(c.x + Math.cos(t) * rx * d, c.y + Math.sin(t) * ry * d, 6 * Z, 6 * Z * TILT, 0, 0, TAU)
+        ctx.fill()
+      }
+    }
+    // The lip: where a slow drift skates instead of falling. Show it so players learn it.
+    if (pose.shape !== 'poly' && pose.r > 90) {
+      const lip = Math.max(0, pose.r - 52) / pose.r
+      ctx.beginPath()
+      ctx.ellipse(c.x, c.y, rx, ry, 0, 0, TAU)
+      ctx.ellipse(c.x, c.y, rx * lip, ry * lip, 0, 0, TAU, true)
+      ctx.fillStyle = hexA(shade(floor, -0.5), 0.35)
+      ctx.fill('evenodd')
+      const lp = this.lipTile(rim)
+      if (lp) {
+        const o = project(0, 0)
+        lp.setTransform(new DOMMatrix([Z, 0, 0, Z * TILT, o.x + this.clock * 6 * Z, o.y]))
+        ctx.fillStyle = lp
+        ctx.fill('evenodd')
+      }
+      ctx.strokeStyle = hexA(rim, 0.25)
+      ctx.lineWidth = 1.5 * this.dpr
+      ctx.setLineDash([3 * this.dpr, 7 * this.dpr])
+      ctx.beginPath()
+      ctx.ellipse(c.x, c.y, rx * lip, ry * lip, 0, 0, TAU)
+      ctx.stroke()
+      ctx.setLineDash([])
+    }
+    ctx.restore()
+
+    // Rim: a glowing lip, a bright edge and a dark undercut.
+    const hot = match.finalPhase || match.status === 'sudden'
+    const rimCol = pose.warn ? '#ff3b2f' : hot ? mixHex(rim, '#ff3b2f', 0.4 + Math.sin(this.clock * 8) * 0.3) : rim
+    const stroke = (width: number, style: string) => {
+      ctx.lineWidth = width
+      ctx.strokeStyle = style
+      if (pose.shape === 'poly') {
+        ctx.beginPath()
+        this.polyPath(pose, project)
+        ctx.stroke()
+      } else {
+        ctx.beginPath()
+        ctx.ellipse(c.x, c.y, rx, ry, 0, 0, TAU)
+        ctx.stroke()
+      }
+    }
+    ctx.save()
+    ctx.globalCompositeOperation = 'lighter'
+    stroke(14 * this.dpr, hexA(rimCol, hot ? 0.3 : 0.16))
+    ctx.restore()
+    stroke(5 * this.dpr, shade(rimCol, -0.35))
+    stroke(2.5 * this.dpr, mixHex(rimCol, '#ffffff', 0.35))
+    if (pose.shape !== 'poly') {
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.setLineDash([2 * this.dpr, 22 * this.dpr])
+      ctx.lineDashOffset = -this.clock * 30 * this.dpr
+      ctx.lineCap = 'round'
+      stroke(4 * this.dpr, hexA('#ffffff', 0.7))
       ctx.restore()
     }
-
-    // Danger rim: marching hazard stripes, brighter in the final phase.
-    const hot = match.finalPhase || match.status === 'sudden'
-    const rimW = 7 * this.dpr
-    const drawRim = (cx: number, cy: number, rr: number) => {
+    if (pose.shape === 'ring') {
+      const irx = pose.inner * Z
+      const iry = pose.inner * Z * TILT
+      ctx.save()
       ctx.beginPath()
-      ctx.arc(cx, cy, rr, 0, TAU)
-      ctx.lineWidth = rimW * 3
-      ctx.strokeStyle = hexA(rim, hot ? 0.22 + Math.sin(this.clock * 8) * 0.08 : 0.12)
-      ctx.stroke()
-      ctx.lineWidth = rimW
-      ctx.strokeStyle = mixHex(rim, '#000000', 0.55)
-      ctx.stroke()
-      ctx.setLineDash([10 * this.dpr, 10 * this.dpr])
-      ctx.lineDashOffset = this.clock * 24 * this.dpr
-      ctx.strokeStyle = rim
-      ctx.stroke()
-      ctx.setLineDash([])
-      ctx.lineWidth = 1.5 * this.dpr
-      ctx.strokeStyle = hexA('#ffffff', 0.45)
+      ctx.ellipse(c.x, c.y, irx, iry, 0, 0, TAU)
+      ctx.clip()
+      ctx.fillStyle = '#02030a'
+      ctx.fillRect(c.x - irx, c.y - iry, irx * 2, iry * 2)
+      // The far inner wall of the hole.
+      const D = DEPTH * Z
+      const wg = ctx.createLinearGradient(0, c.y - iry, 0, c.y - iry + D)
+      wg.addColorStop(0, shade(floor, -0.35))
+      wg.addColorStop(1, shade(floor, -0.9))
+      ctx.fillStyle = wg
       ctx.beginPath()
-      ctx.arc(cx, cy, Math.max(1, rr - rimW / 2 - 1.5 * this.dpr), 0, TAU)
+      ctx.ellipse(c.x, c.y, irx, iry, 0, Math.PI, TAU)
+      ctx.lineTo(c.x + irx, c.y + D)
+      ctx.ellipse(c.x, c.y + D, irx, iry, 0, 0, Math.PI, true)
+      ctx.closePath()
+      ctx.fill()
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.strokeStyle = hexA(rim, 0.45)
+      ctx.lineWidth = 2 * this.dpr
+      ctx.beginPath()
+      ctx.ellipse(c.x, c.y + D * 0.42, irx, iry, 0, Math.PI + 0.1, TAU - 0.1)
       ctx.stroke()
-    }
-    if (pose.shape === 'poly') {
-      path()
-      ctx.lineWidth = rimW * 3
-      ctx.strokeStyle = hexA(rim, hot ? 0.22 : 0.12)
+      ctx.restore()
+      ctx.beginPath()
+      ctx.ellipse(c.x, c.y, irx, iry, 0, 0, TAU)
+      ctx.lineWidth = 3 * this.dpr
+      ctx.strokeStyle = mixHex(rimCol, '#ffffff', 0.3)
       ctx.stroke()
-      ctx.lineWidth = rimW
-      ctx.strokeStyle = mixHex(rim, '#000000', 0.55)
-      ctx.stroke()
-      ctx.setLineDash([10 * this.dpr, 10 * this.dpr])
-      ctx.lineDashOffset = this.clock * 24 * this.dpr
-      ctx.strokeStyle = rim
-      ctx.stroke()
-      ctx.setLineDash([])
-    } else {
-      drawRim(c.x, c.y, r)
-      if (pose.shape === 'ring') {
-        ctx.save()
-        ctx.beginPath()
-        ctx.arc(c.x, c.y, pose.inner * zoom, 0, TAU)
-        ctx.fillStyle = 'rgba(2,4,8,0.75)'
-        ctx.fill()
-        ctx.restore()
-        drawRim(c.x, c.y, pose.inner * zoom)
-      }
     }
     ctx.restore()
   }
 
   /** Red glow on the rim right where a ball is about to leave. */
-  private edgeGlow(bodies: Body[], project: Project, zoom: number): void {
+  private edgeGlow(bodies: Body[], project: Project): void {
     const ctx = this.ctx
     ctx.save()
     ctx.globalCompositeOperation = 'lighter'
     for (const b of bodies) {
-      if (b.decoy || b.edgeDist > 70 || b.edgeDist < -40) continue
-      const k = clamp(1 - b.edgeDist / 70, 0, 1)
+      if (b.decoy || b.edgeDist > 80 || b.edgeDist < -40) continue
+      const k = clamp(1 - b.edgeDist / 80, 0, 1)
       const ex = b.x - b.safetyX * b.edgeDist
       const ey = b.y - b.safetyY * b.edgeDist
       const s = project(ex, ey)
-      const rr = (50 + k * 40) * zoom
+      const rr = (60 + k * 50) * this.Z
       const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rr)
-      g.addColorStop(0, hexA('#ff4d3a', 0.5 * k))
+      g.addColorStop(0, hexA('#ff4d3a', 0.55 * k))
       g.addColorStop(1, hexA('#ff4d3a', 0))
       ctx.fillStyle = g
-      ctx.fillRect(s.x - rr, s.y - rr, rr * 2, rr * 2)
+      ctx.beginPath()
+      ctx.ellipse(s.x, s.y, rr, rr * TILT, 0, 0, TAU)
+      ctx.fill()
     }
     ctx.restore()
   }
 
-  private walls(match: Match, project: Project): void {
+  private wall(wall: { x1: number; y1: number; x2: number; y2: number; lethal: boolean }, project: Project, match: Match): void {
     const ctx = this.ctx
+    const a0 = project(wall.x1, wall.y1)
+    const b0 = project(wall.x2, wall.y2)
+    const a1 = project(wall.x1, wall.y1, WALL_H)
+    const b1 = project(wall.x2, wall.y2, WALL_H)
+    const col = wall.lethal ? '#ff4d3a' : match.arena.rim
     ctx.save()
     ctx.lineCap = 'round'
-    for (const wall of wallSegments(match.arena.walls, match.time)) {
-      const a = project(wall.x1, wall.y1)
-      const b = project(wall.x2, wall.y2)
-      ctx.strokeStyle = 'rgba(0,0,0,0.45)'
-      ctx.lineWidth = 9 * this.dpr
-      ctx.beginPath()
-      ctx.moveTo(a.x, a.y + 5 * this.dpr)
-      ctx.lineTo(b.x, b.y + 5 * this.dpr)
-      ctx.stroke()
-      ctx.strokeStyle = hexA(match.arena.rim, 0.35)
-      ctx.lineWidth = 12 * this.dpr
-      ctx.beginPath()
-      ctx.moveTo(a.x, a.y)
-      ctx.lineTo(b.x, b.y)
-      ctx.stroke()
-      ctx.strokeStyle = '#f4f7fb'
-      ctx.lineWidth = 4 * this.dpr
-      ctx.stroke()
-    }
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)'
+    ctx.lineWidth = 12 * this.dpr
+    ctx.beginPath()
+    ctx.moveTo(a0.x, a0.y + 4 * this.dpr)
+    ctx.lineTo(b0.x, b0.y + 4 * this.dpr)
+    ctx.stroke()
+    const g = ctx.createLinearGradient(0, Math.min(a1.y, b1.y), 0, Math.max(a0.y, b0.y))
+    g.addColorStop(0, shade(col, -0.2))
+    g.addColorStop(1, shade(col, -0.75))
+    ctx.fillStyle = g
+    ctx.beginPath()
+    ctx.moveTo(a0.x, a0.y)
+    ctx.lineTo(b0.x, b0.y)
+    ctx.lineTo(b1.x, b1.y)
+    ctx.lineTo(a1.x, a1.y)
+    ctx.closePath()
+    ctx.fill()
+    ctx.globalCompositeOperation = 'lighter'
+    ctx.strokeStyle = hexA(col, 0.4)
+    ctx.lineWidth = 10 * this.dpr
+    ctx.beginPath()
+    ctx.moveTo(a1.x, a1.y)
+    ctx.lineTo(b1.x, b1.y)
+    ctx.stroke()
+    ctx.globalCompositeOperation = 'source-over'
+    ctx.strokeStyle = mixHex(col, '#ffffff', 0.6)
+    ctx.lineWidth = 3.5 * this.dpr
+    ctx.stroke()
     ctx.restore()
   }
 
-  private hazards(match: Match, project: Project, zoom: number): void {
+  // ================================================================ hazards
+
+  private groundHazards(match: Match, project: Project): void {
     const ctx = this.ctx
     const T = this.clock
     const dpr = this.dpr
+    const Z = this.Z
     for (const h of [...match.arena.hazards, ...match.extras]) {
       const p = hazardPose(h, match.time)
       const s = project(p.x, p.y)
-      const r = Math.max(4, p.r * zoom)
+      const r = Math.max(4, p.r * Z)
+      const ry = r * TILT
       ctx.save()
       if (h.kind === 'lava') {
         const pulse = 0.5 + Math.sin(T * 4) * 0.5
-        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * 1.25)
-        g.addColorStop(0, '#ffd27a')
-        g.addColorStop(0.45, '#ff6a2a')
-        g.addColorStop(0.85, '#c21f12')
-        g.addColorStop(1, 'rgba(194,31,18,0)')
+        ctx.globalCompositeOperation = 'lighter'
+        const halo = ctx.createRadialGradient(s.x, s.y, r * 0.8, s.x, s.y, r * 1.6)
+        halo.addColorStop(0, hexA('#ff6a2a', 0.35))
+        halo.addColorStop(1, hexA('#ff6a2a', 0))
+        ctx.fillStyle = halo
         ctx.beginPath()
-        ctx.arc(s.x, s.y, r * 1.25, 0, TAU)
+        ctx.ellipse(s.x, s.y, r * 1.6, ry * 1.6, 0, 0, TAU)
+        ctx.fill()
+        ctx.globalCompositeOperation = 'source-over'
+        const g = ctx.createRadialGradient(s.x, s.y - ry * 0.2, 0, s.x, s.y, r)
+        g.addColorStop(0, '#fff0a8')
+        g.addColorStop(0.35, '#ffb02e')
+        g.addColorStop(0.75, '#ff4d1a')
+        g.addColorStop(1, '#8a1408')
+        ctx.beginPath()
+        ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
         ctx.fillStyle = g
         ctx.fill()
+        ctx.clip()
         ctx.globalCompositeOperation = 'lighter'
-        for (let i = 0; i < 7; i++) {
-          const a = i * 2.4 + T * 0.3
-          const d = ((i * 0.37 + T * 0.12) % 1) * r * 0.8
-          const br = (1 - ((T * 0.8 + i * 0.3) % 1)) * r * 0.14
+        for (let i = 0; i < 12; i++) {
+          const a = i * 2.4 + T * 0.25
+          const d = ((i * 0.37 + T * 0.1) % 1) * r * 0.85
+          const life = (T * 0.7 + i * 0.29) % 1
+          const br = Math.sin(life * Math.PI) * r * 0.12
           ctx.beginPath()
-          ctx.arc(s.x + Math.cos(a) * d, s.y + Math.sin(a) * d, br, 0, TAU)
-          ctx.fillStyle = hexA('#ffe3a0', 0.35 + pulse * 0.2)
+          ctx.ellipse(s.x + Math.cos(a) * d, s.y + Math.sin(a) * d * TILT, br, br * TILT, 0, 0, TAU)
+          ctx.fillStyle = hexA('#fff3c4', 0.35 + pulse * 0.25)
           ctx.fill()
         }
-        ctx.globalCompositeOperation = 'source-over'
+        ctx.restore()
+        ctx.save()
         ctx.beginPath()
-        ctx.arc(s.x, s.y, r, 0, TAU)
-        ctx.strokeStyle = hexA('#ffb199', 0.5 + pulse * 0.4)
-        ctx.lineWidth = 2 * dpr
+        ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
+        ctx.strokeStyle = hexA('#3a0a04', 0.8)
+        ctx.lineWidth = 4 * dpr
         ctx.stroke()
+        // Heat rising off the pool.
+        if (Math.random() < 0.3) this.add({ kind: 'ember', x: p.x + (Math.random() - 0.5) * p.r * 1.6, y: p.y + (Math.random() - 0.5) * p.r * 1.6, z: 4, vz: 60 + Math.random() * 60, size: 2 + Math.random() * 2, color: Math.random() < 0.5 ? '#ffc14d' : '#ff6a2a', life: 0.9, drag: 1 })
       } else if (h.kind === 'spikes') {
-        const n = 10
         ctx.beginPath()
-        for (let i = 0; i <= n * 2; i++) {
-          const a = (i / (n * 2)) * TAU + T * 0.4
-          const rr = i % 2 ? r * 0.55 : r
-          ctx.lineTo(s.x + Math.cos(a) * rr, s.y + Math.sin(a) * rr)
-        }
-        ctx.closePath()
-        ctx.fillStyle = '#ff4d3a'
+        ctx.ellipse(s.x, s.y, r * 1.1, ry * 1.1, 0, 0, TAU)
+        ctx.fillStyle = '#1a0d12'
         ctx.fill()
-        ctx.strokeStyle = '#ffd0c8'
-        ctx.lineWidth = 1.5 * dpr
+        ctx.strokeStyle = hexA('#ff4d3a', 0.8)
+        ctx.lineWidth = 2.5 * dpr
+        ctx.setLineDash([6 * dpr, 4 * dpr])
+        ctx.lineDashOffset = T * 20
         ctx.stroke()
       } else if (h.kind === 'bumper') {
-        const pulse = 1 + Math.sin(T * 5 + h.x) * 0.04
         ctx.beginPath()
-        ctx.arc(s.x, s.y + 5 * dpr, r * pulse, 0, TAU)
-        ctx.fillStyle = 'rgba(0,0,0,0.4)'
+        ctx.ellipse(s.x, s.y, r * 1.15, ry * 1.15, 0, 0, TAU)
+        ctx.fillStyle = 'rgba(0,0,0,0.35)'
         ctx.fill()
         ctx.globalCompositeOperation = 'lighter'
-        const halo = ctx.createRadialGradient(s.x, s.y, r * 0.6, s.x, s.y, r * 1.7)
-        halo.addColorStop(0, hexA(h.color, 0.35))
+        const halo = ctx.createRadialGradient(s.x, s.y, r * 0.8, s.x, s.y, r * 2)
+        halo.addColorStop(0, hexA(h.color, 0.28))
         halo.addColorStop(1, hexA(h.color, 0))
         ctx.fillStyle = halo
-        ctx.fillRect(s.x - r * 1.7, s.y - r * 1.7, r * 3.4, r * 3.4)
-        ctx.globalCompositeOperation = 'source-over'
-        const g = ctx.createRadialGradient(s.x - r * 0.3, s.y - r * 0.35, r * 0.1, s.x, s.y, r * pulse)
-        g.addColorStop(0, mixHex(h.color, '#ffffff', 0.6))
-        g.addColorStop(0.6, h.color)
-        g.addColorStop(1, mixHex(h.color, '#000000', 0.4))
         ctx.beginPath()
-        ctx.arc(s.x, s.y, r * pulse, 0, TAU)
-        ctx.fillStyle = g
+        ctx.ellipse(s.x, s.y, r * 2, ry * 2, 0, 0, TAU)
         ctx.fill()
-        ctx.lineWidth = 3 * dpr
-        ctx.strokeStyle = '#ffffff'
-        ctx.stroke()
-        ctx.beginPath()
-        ctx.arc(s.x, s.y, r * 0.55, 0, TAU)
-        ctx.strokeStyle = hexA('#ffffff', 0.6)
-        ctx.lineWidth = 2 * dpr
-        ctx.stroke()
       } else if (h.kind === 'portal') {
         ctx.globalCompositeOperation = 'lighter'
-        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * 1.3)
-        g.addColorStop(0, hexA(h.color, 0.55))
-        g.addColorStop(0.7, hexA(h.color, 0.15))
+        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * 1.4)
+        g.addColorStop(0, hexA(h.color, 0.7))
+        g.addColorStop(0.6, hexA(h.color, 0.2))
         g.addColorStop(1, hexA(h.color, 0))
         ctx.fillStyle = g
         ctx.beginPath()
-        ctx.arc(s.x, s.y, r * 1.3, 0, TAU)
+        ctx.ellipse(s.x, s.y, r * 1.4, ry * 1.4, 0, 0, TAU)
+        ctx.fill()
+        ctx.strokeStyle = h.color
+        ctx.lineWidth = 3 * dpr
+        ctx.lineCap = 'round'
+        for (let i = 0; i < 4; i++) {
+          const a = T * 2.5 + (i * TAU) / 4
+          const rr = 0.35 + i * 0.18
+          ctx.beginPath()
+          ctx.ellipse(s.x, s.y, r * rr, ry * rr, 0, a, a + 2)
+          ctx.stroke()
+        }
+        if (Math.random() < 0.25) this.add({ kind: 'star', x: p.x + (Math.random() - 0.5) * p.r, y: p.y + (Math.random() - 0.5) * p.r, z: 2, vz: 90, size: 3, color: h.color, life: 0.8, drag: 1 })
+      } else if (h.kind === 'launcher') {
+        ctx.beginPath()
+        ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
+        ctx.fillStyle = hexA(h.color, 0.16)
         ctx.fill()
         ctx.strokeStyle = h.color
         ctx.lineWidth = 2.5 * dpr
-        for (let i = 0; i < 3; i++) {
-          const a = T * 2.5 + (i * TAU) / 3
-          ctx.beginPath()
-          ctx.arc(s.x, s.y, r * (0.45 + i * 0.22), a, a + 2.2)
-          ctx.stroke()
-        }
-      } else if (h.kind === 'launcher') {
-        ctx.beginPath()
-        ctx.arc(s.x, s.y, r, 0, TAU)
-        ctx.fillStyle = hexA(h.color, 0.18)
-        ctx.fill()
-        ctx.strokeStyle = h.color
-        ctx.lineWidth = 2 * dpr
         ctx.stroke()
-        ctx.translate(s.x, s.y)
-        ctx.rotate(h.angle)
-        ctx.beginPath()
-        ctx.arc(0, 0, r, 0, TAU)
         ctx.clip()
+        this.groundOn(p.x, p.y)
+        ctx.rotate(h.angle)
+        const R = p.r
         for (let i = 0; i < 3; i++) {
-          const u = ((T * 1.6 + i / 3) % 1)
-          const x = lerp(-r * 0.8, r * 0.8, u)
+          const u = (T * 1.6 + i / 3) % 1
+          const x = lerp(-R * 0.8, R * 0.8, u)
           ctx.globalAlpha = Math.sin(u * Math.PI)
           ctx.beginPath()
-          ctx.moveTo(x - r * 0.25, -r * 0.4)
-          ctx.lineTo(x + r * 0.15, 0)
-          ctx.lineTo(x - r * 0.25, r * 0.4)
+          ctx.moveTo(x - R * 0.25, -R * 0.42)
+          ctx.lineTo(x + R * 0.15, 0)
+          ctx.lineTo(x - R * 0.25, R * 0.42)
           ctx.strokeStyle = h.color
-          ctx.lineWidth = 4 * dpr
+          ctx.lineWidth = (5 * dpr) / Z
           ctx.lineJoin = 'round'
+          ctx.lineCap = 'round'
           ctx.stroke()
         }
       } else if (h.kind === 'blackhole') {
-        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * 1.4)
-        g.addColorStop(0, '#000000')
-        g.addColorStop(0.55, 'rgba(40,10,80,0.9)')
-        g.addColorStop(1, 'rgba(80,40,160,0)')
-        ctx.beginPath()
-        ctx.arc(s.x, s.y, r * 1.4, 0, TAU)
-        ctx.fillStyle = g
-        ctx.fill()
-        ctx.strokeStyle = hexA('#b388ff', 0.7)
-        ctx.lineWidth = 2 * dpr
-        for (let i = 0; i < 4; i++) {
-          const a = -T * 3 + (i * TAU) / 4
-          ctx.beginPath()
-          ctx.arc(s.x, s.y, r * (0.5 + (i % 2) * 0.4), a, a + 1.4)
-          ctx.stroke()
-        }
+        this.vortex(s.x, s.y, r * 1.3, '#b388ff', T)
       } else if (h.kind === 'explosive') {
         const warn = explosiveWarn(h, match.time)
         const blink = warn ? (Math.sin(T * 30) > 0 ? 1 : 0.4) : 0.6
         ctx.beginPath()
-        ctx.arc(s.x, s.y, r, 0, TAU)
-        ctx.fillStyle = hexA('#ff4d3a', 0.2 * blink)
+        ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
+        ctx.fillStyle = hexA('#ff4d3a', (warn ? 0.28 : 0.12) * blink)
         ctx.fill()
-        ctx.setLineDash([6 * dpr, 5 * dpr])
+        ctx.setLineDash([8 * dpr, 6 * dpr])
         ctx.lineDashOffset = T * 20
         ctx.strokeStyle = hexA('#ffc14d', blink)
-        ctx.lineWidth = 2.5 * dpr
+        ctx.lineWidth = 3 * dpr
         ctx.stroke()
+        ctx.setLineDash([])
+        ctx.fillStyle = hexA('#ffc14d', blink)
+        ctx.font = `${16 * dpr * (Z / 0.7)}px ${DISPLAY_FONT}`
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText('!', s.x, s.y)
       } else if (h.kind === 'laser') {
         const mode = laserMode(h, match.time)
-        const start = project(h.x, h.y)
-        ctx.beginPath()
-        ctx.arc(start.x, start.y, 9 * dpr, 0, TAU)
-        ctx.fillStyle = mode === 'hot' ? '#ff4d3a' : '#3a2a2a'
-        ctx.fill()
-        ctx.strokeStyle = '#ffc14d'
-        ctx.lineWidth = 2 * dpr
-        ctx.stroke()
         if (mode !== 'off') {
           const ang = laserAngle(h, match.time)
           const end = project(h.x + Math.cos(ang) * p.r, h.y + Math.sin(ang) * p.r)
+          const start = project(h.x, h.y)
           ctx.lineCap = 'round'
           if (mode === 'hot') {
             ctx.globalCompositeOperation = 'lighter'
-            for (const [wd, col] of [[22, 'rgba(255,60,40,0.18)'], [11, 'rgba(255,90,60,0.5)'], [4, '#fff2ea']] as const) {
-              ctx.strokeStyle = col
-              ctx.lineWidth = (wd + Math.sin(T * 60) * 1.5) * dpr
-              ctx.beginPath()
-              ctx.moveTo(start.x, start.y)
-              ctx.lineTo(end.x, end.y)
-              ctx.stroke()
-            }
+            ctx.strokeStyle = 'rgba(255,60,40,0.25)'
+            ctx.lineWidth = 34 * dpr * (Z / 0.7)
+            ctx.beginPath()
+            ctx.moveTo(start.x, start.y)
+            ctx.lineTo(end.x, end.y)
+            ctx.stroke()
           } else {
             ctx.setLineDash([10 * dpr, 8 * dpr])
             ctx.lineDashOffset = -T * 80
-            ctx.strokeStyle = `rgba(255,193,77,${0.5 + Math.sin(T * 24) * 0.3})`
-            ctx.lineWidth = 2 * dpr
+            ctx.strokeStyle = `rgba(255,193,77,${0.45 + Math.sin(T * 24) * 0.3})`
+            ctx.lineWidth = 2.5 * dpr
             ctx.beginPath()
             ctx.moveTo(start.x, start.y)
             ctx.lineTo(end.x, end.y)
@@ -958,61 +1572,68 @@ export class Renderer {
           }
         }
       } else if (h.kind === 'conveyor' || h.kind === 'gravity' || h.kind === 'ice' || h.kind === 'crusher') {
-        const hw = (h.w || h.r * 2) * zoom
-        const hh = (h.h || h.r * 2) * zoom
-        const x0 = s.x - hw / 2
-        const y0 = s.y - hh / 2
+        const hw = h.w || h.r * 2
+        const hh = h.h || h.r * 2
+        this.groundOn(p.x, p.y)
+        const x0 = -hw / 2
+        const y0 = -hh / 2
         ctx.beginPath()
         ctx.rect(x0, y0, hw, hh)
         ctx.clip()
+        const px = dpr / Z
         if (h.kind === 'conveyor') {
-          ctx.fillStyle = hexA(h.color, 0.12)
+          ctx.fillStyle = hexA(shade(h.color, -0.6), 0.55)
           ctx.fillRect(x0, y0, hw, hh)
-          const step = 46 * zoom
+          const step = 46
           const dir = Math.cos(h.angle) >= 0 ? 1 : -1
-          const off = ((T * h.speed * zoom * dir) % step + step) % step
-          ctx.strokeStyle = hexA(h.color, 0.4)
-          ctx.lineWidth = 4 * dpr
+          const off = (((T * h.speed * dir) % step) + step) % step
+          ctx.strokeStyle = hexA(h.color, 0.55)
+          ctx.lineWidth = 5 * px
           ctx.lineJoin = 'round'
+          ctx.lineCap = 'round'
           for (let x = x0 - step + off; x < x0 + hw + step; x += step) {
             ctx.beginPath()
-            ctx.moveTo(x - dir * hh * 0.18, s.y - hh * 0.3)
-            ctx.lineTo(x + dir * hh * 0.12, s.y)
-            ctx.lineTo(x - dir * hh * 0.18, s.y + hh * 0.3)
+            ctx.moveTo(x - dir * hh * 0.18, -hh * 0.3)
+            ctx.lineTo(x + dir * hh * 0.12, 0)
+            ctx.lineTo(x - dir * hh * 0.18, hh * 0.3)
             ctx.stroke()
           }
-          ctx.strokeStyle = hexA(h.color, 0.5)
-          ctx.lineWidth = 2 * dpr
+          ctx.strokeStyle = hexA(h.color, 0.7)
+          ctx.lineWidth = 3 * px
           ctx.strokeRect(x0, y0, hw, hh)
         } else if (h.kind === 'gravity') {
           const light = h.speed < 1
-          ctx.fillStyle = light ? 'rgba(126,224,255,0.1)' : 'rgba(214,255,74,0.08)'
+          ctx.fillStyle = light ? 'rgba(126,224,255,0.07)' : 'rgba(214,255,74,0.06)'
           ctx.fillRect(x0, y0, hw, hh)
-          ctx.fillStyle = light ? 'rgba(126,224,255,0.45)' : 'rgba(214,255,74,0.35)'
-          for (let i = 0; i < 26; i++) {
+          ctx.fillStyle = light ? 'rgba(126,224,255,0.55)' : 'rgba(214,255,74,0.45)'
+          for (let i = 0; i < 30; i++) {
             const fx = ((i * 0.618) % 1) * hw
             const drift = light ? -1 : 1
-            const fy = ((((i * 0.37) + T * 0.05 * (light ? 1 : 2.2) * drift) % 1) + 1) % 1 * hh
-            const sz = (light ? 2.5 : 1.8) * dpr
+            const fy = (((((i * 0.37) + T * 0.05 * (light ? 1 : 2.2) * drift) % 1) + 1) % 1) * hh
+            const sz = (light ? 3 : 2.2) * px
             ctx.fillRect(x0 + fx, y0 + fy, sz, light ? sz : sz * 4)
           }
+          ctx.strokeStyle = light ? 'rgba(126,224,255,0.45)' : 'rgba(214,255,74,0.4)'
+          ctx.lineWidth = 2 * px
+          ctx.setLineDash([8 * px, 6 * px])
+          ctx.strokeRect(x0, y0, hw, hh)
         } else if (h.kind === 'ice') {
-          ctx.fillStyle = 'rgba(191,232,255,0.14)'
+          ctx.fillStyle = 'rgba(191,232,255,0.18)'
           ctx.fillRect(x0, y0, hw, hh)
-          ctx.strokeStyle = 'rgba(255,255,255,0.18)'
-          ctx.lineWidth = 2 * dpr
-          for (let x = x0 - hh; x < x0 + hw; x += 40 * dpr) {
+          ctx.strokeStyle = 'rgba(255,255,255,0.25)'
+          ctx.lineWidth = 2 * px
+          for (let x = x0 - hh; x < x0 + hw; x += 40) {
             ctx.beginPath()
             ctx.moveTo(x, y0 + hh)
             ctx.lineTo(x + hh, y0)
             ctx.stroke()
           }
         } else {
-          ctx.fillStyle = 'rgba(255,255,255,0.1)'
+          ctx.fillStyle = 'rgba(30,24,10,0.6)'
           ctx.fillRect(x0, y0, hw, hh)
-          ctx.strokeStyle = 'rgba(255,193,77,0.5)'
-          ctx.lineWidth = 6 * dpr
-          for (let x = x0 - hh; x < x0 + hw; x += 22 * dpr) {
+          ctx.strokeStyle = 'rgba(255,193,77,0.6)'
+          ctx.lineWidth = 8 * px
+          for (let x = x0 - hh; x < x0 + hw; x += 26) {
             ctx.beginPath()
             ctx.moveTo(x, y0 + hh)
             ctx.lineTo(x + hh, y0)
@@ -1024,76 +1645,213 @@ export class Renderer {
     }
   }
 
-  private events(match: Match, project: Project, zoom: number): void {
+  /** Bumpers, spikes and laser posts stand up, so they sort with the balls. */
+  private uprightHazards(match: Match, project: Project, items: DrawItem[]): void {
     const ctx = this.ctx
     const dpr = this.dpr
+    const Z = this.Z
+    const T = this.clock
+    for (const h of [...match.arena.hazards, ...match.extras]) {
+      const p = hazardPose(h, match.time)
+      if (h.kind === 'bumper') {
+        items.push({
+          y: p.y,
+          draw: () => {
+            const pulse = 1 + Math.sin(T * 5 + h.x) * 0.03
+            const r = p.r * Z * pulse
+            const H = 24 * Z
+            const base = project(p.x, p.y)
+            const ry = r * TILT
+            const side = ctx.createLinearGradient(base.x - r, 0, base.x + r, 0)
+            side.addColorStop(0, shade(h.color, -0.6))
+            side.addColorStop(0.35, shade(h.color, -0.15))
+            side.addColorStop(1, shade(h.color, -0.7))
+            ctx.fillStyle = side
+            ctx.beginPath()
+            ctx.ellipse(base.x, base.y, r, ry, 0, 0, Math.PI)
+            ctx.lineTo(base.x - r, base.y - H)
+            ctx.ellipse(base.x, base.y - H, r, ry, 0, Math.PI, 0, true)
+            ctx.closePath()
+            ctx.fill()
+            const g = ctx.createRadialGradient(base.x - r * 0.3, base.y - H - ry * 0.4, r * 0.1, base.x, base.y - H, r)
+            g.addColorStop(0, shade(h.color, 0.65))
+            g.addColorStop(0.6, h.color)
+            g.addColorStop(1, shade(h.color, -0.3))
+            ctx.beginPath()
+            ctx.ellipse(base.x, base.y - H, r, ry, 0, 0, TAU)
+            ctx.fillStyle = g
+            ctx.fill()
+            ctx.lineWidth = 3 * dpr
+            ctx.strokeStyle = '#ffffff'
+            ctx.stroke()
+            ctx.beginPath()
+            ctx.ellipse(base.x, base.y - H, r * 0.55, ry * 0.55, 0, 0, TAU)
+            ctx.strokeStyle = hexA('#ffffff', 0.55)
+            ctx.lineWidth = 2 * dpr
+            ctx.stroke()
+          },
+        })
+      } else if (h.kind === 'spikes') {
+        items.push({
+          y: p.y,
+          draw: () => {
+            const n = 9
+            const spikes: { a: number; d: number }[] = [{ a: 0, d: 0 }]
+            for (let i = 0; i < n; i++) spikes.push({ a: (i / n) * TAU + T * 0.4, d: 0.62 })
+            spikes.sort((u, v) => Math.sin(u.a) * u.d - Math.sin(v.a) * v.d)
+            for (const sp of spikes) {
+              const x = p.x + Math.cos(sp.a) * p.r * sp.d
+              const y = p.y + Math.sin(sp.a) * p.r * sp.d
+              const b = project(x, y)
+              const tip = project(x, y, p.r * (sp.d ? 0.8 : 1.1))
+              const bw = p.r * Z * 0.22
+              const g = ctx.createLinearGradient(b.x - bw, 0, b.x + bw, 0)
+              g.addColorStop(0, '#5b1a1a')
+              g.addColorStop(0.45, '#ffd0c8')
+              g.addColorStop(1, '#7a1f1f')
+              ctx.fillStyle = g
+              ctx.beginPath()
+              ctx.moveTo(b.x - bw, b.y)
+              ctx.lineTo(tip.x, tip.y)
+              ctx.lineTo(b.x + bw, b.y)
+              ctx.closePath()
+              ctx.fill()
+            }
+          },
+        })
+      } else if (h.kind === 'laser') {
+        items.push({
+          y: h.y,
+          draw: () => {
+            const mode = laserMode(h, match.time)
+            const base = project(h.x, h.y)
+            const top = project(h.x, h.y, 30)
+            const r = 12 * Z
+            ctx.fillStyle = '#2a2030'
+            ctx.fillRect(base.x - r * 0.6, top.y, r * 1.2, base.y - top.y)
+            ctx.beginPath()
+            ctx.ellipse(top.x, top.y, r, r * TILT, 0, 0, TAU)
+            ctx.fillStyle = mode === 'hot' ? '#ff4d3a' : mode === 'warn' ? '#ffc14d' : '#4a3a4a'
+            ctx.fill()
+            ctx.strokeStyle = '#ffc14d'
+            ctx.lineWidth = 2 * dpr
+            ctx.stroke()
+            if (mode === 'hot') {
+              const ang = laserAngle(h, match.time)
+              const end = project(h.x + Math.cos(ang) * p.r, h.y + Math.sin(ang) * p.r, 18)
+              const st = project(h.x, h.y, 18)
+              ctx.save()
+              ctx.globalCompositeOperation = 'lighter'
+              ctx.lineCap = 'round'
+              for (const [wd, col] of [[18, 'rgba(255,60,40,0.3)'], [8, 'rgba(255,110,80,0.7)'], [3, '#fff2ea']] as const) {
+                ctx.strokeStyle = col
+                ctx.lineWidth = (wd + Math.sin(T * 60) * 1.5) * dpr * (Z / 0.7)
+                ctx.beginPath()
+                ctx.moveTo(st.x, st.y)
+                ctx.lineTo(end.x, end.y)
+                ctx.stroke()
+              }
+              ctx.restore()
+              if (Math.random() < 0.5) {
+                const u = Math.random()
+                this.add({ kind: 'spark', x: h.x + Math.cos(ang) * p.r * u, y: h.y + Math.sin(ang) * p.r * u, z: 18, vx: (Math.random() - 0.5) * 200, vy: (Math.random() - 0.5) * 200, vz: 150, g: 900, size: 1.6, color: '#ffb199', life: 0.3, drag: 3 })
+              }
+            }
+          },
+        })
+      }
+    }
+  }
+
+  private vortex(x: number, y: number, r: number, color: string, T: number): void {
+    const ctx = this.ctx
+    const ry = r * TILT
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r)
+    g.addColorStop(0, '#000000')
+    g.addColorStop(0.5, 'rgba(30,8,60,0.95)')
+    g.addColorStop(1, hexA(color, 0))
+    ctx.beginPath()
+    ctx.ellipse(x, y, r, ry, 0, 0, TAU)
+    ctx.fillStyle = g
+    ctx.fill()
+    ctx.save()
+    ctx.globalCompositeOperation = 'lighter'
+    ctx.lineCap = 'round'
+    for (let i = 0; i < 6; i++) {
+      const a = -T * 3 + (i * TAU) / 6
+      const k = 0.35 + (i % 3) * 0.2
+      ctx.strokeStyle = hexA(color, 0.5 + (i % 2) * 0.3)
+      ctx.lineWidth = (2 + (i % 2)) * this.dpr
+      ctx.beginPath()
+      ctx.ellipse(x, y, r * k, ry * k, 0, a, a + 1.6)
+      ctx.stroke()
+    }
+    ctx.restore()
+    ctx.beginPath()
+    ctx.ellipse(x, y, r * 0.18, ry * 0.18, 0, 0, TAU)
+    ctx.fillStyle = '#000'
+    ctx.fill()
+  }
+
+  /** World-space transform on the floor plane, centred on (x, y). Line widths are in world units. */
+  private groundOn(x: number, y: number): void {
+    const Z = this.Z
+    this.ctx.setTransform(Z, 0, 0, Z * TILT, this.OX + (x - this.camX) * Z, this.OY + (y - this.camY) * Z * TILT)
+  }
+
+  // ================================================================ events and zone
+
+  private groundEvents(match: Match, project: Project): void {
+    const ctx = this.ctx
+    const dpr = this.dpr
+    const Z = this.Z
     for (const ev of match.live) {
       const s = project(ev.x, ev.y)
-      const r = Math.max(8, ev.r * zoom)
+      const r = Math.max(8, ev.r * Z)
+      const ry = r * TILT
       ctx.save()
-      if (ev.kind === 'meteor' || ev.kind === 'blast') {
-        if (ev.fired) {
-          ctx.beginPath()
-          ctx.arc(s.x, s.y, r, 0, TAU)
-          ctx.fillStyle = 'rgba(40,20,20,0.35)'
-          ctx.fill()
-        } else {
-          const u = clamp((match.time - ev.born) / Math.max(0.01, ev.dur), 0, 1)
-          ctx.beginPath()
-          ctx.arc(s.x, s.y, r, 0, TAU)
-          ctx.fillStyle = `rgba(255,77,58,${0.08 + u * 0.18})`
-          ctx.fill()
-          ctx.setLineDash([6 * dpr, 5 * dpr])
-          ctx.lineDashOffset = this.clock * 20
-          ctx.strokeStyle = 'rgba(255,193,77,0.9)'
-          ctx.lineWidth = 2 * dpr
-          ctx.stroke()
-          ctx.setLineDash([])
-          ctx.beginPath()
-          ctx.arc(s.x, s.y, r * u, 0, TAU)
-          ctx.strokeStyle = 'rgba(255,77,58,0.9)'
-          ctx.lineWidth = 3 * dpr
-          ctx.stroke()
-          if (ev.kind === 'meteor') {
-            const fall = (1 - u) * 260 * zoom
-            ctx.globalCompositeOperation = 'lighter'
-            const g = ctx.createLinearGradient(s.x + fall * 0.5, s.y - fall, s.x, s.y - fall * 0.1)
-            g.addColorStop(0, 'rgba(255,120,60,0)')
-            g.addColorStop(1, 'rgba(255,200,120,0.9)')
-            ctx.strokeStyle = g
-            ctx.lineWidth = 8 * dpr
-            ctx.lineCap = 'round'
-            ctx.beginPath()
-            ctx.moveTo(s.x + fall * 0.5, s.y - fall)
-            ctx.lineTo(s.x + fall * 0.05, s.y - fall * 0.1)
-            ctx.stroke()
-          }
-        }
-      } else if (ev.kind === 'orb' && !ev.fired) {
-        const bob = Math.sin(this.clock * 6) * 4 * dpr
-        ctx.globalCompositeOperation = 'lighter'
-        const g = ctx.createRadialGradient(s.x, s.y + bob, 0, s.x, s.y + bob, 28 * dpr)
-        g.addColorStop(0, 'rgba(255,193,77,0.8)')
-        g.addColorStop(1, 'rgba(255,193,77,0)')
-        ctx.fillStyle = g
-        ctx.fillRect(s.x - 28 * dpr, s.y + bob - 28 * dpr, 56 * dpr, 56 * dpr)
-        ctx.globalCompositeOperation = 'source-over'
+      if ((ev.kind === 'meteor' || ev.kind === 'blast') && !ev.fired) {
+        const u = clamp((match.time - ev.born) / Math.max(0.01, ev.dur), 0, 1)
         ctx.beginPath()
-        ctx.arc(s.x, s.y + bob, 9 * dpr, 0, TAU)
-        ctx.fillStyle = '#ffe3a0'
+        ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
+        ctx.fillStyle = `rgba(255,77,58,${0.1 + u * 0.22})`
         ctx.fill()
-        ctx.strokeStyle = '#ffc14d'
+        ctx.setLineDash([8 * dpr, 6 * dpr])
+        ctx.lineDashOffset = this.clock * 30
+        ctx.strokeStyle = 'rgba(255,193,77,0.95)'
+        ctx.lineWidth = 3 * dpr
+        ctx.stroke()
+        ctx.setLineDash([])
+        ctx.beginPath()
+        ctx.ellipse(s.x, s.y, r * u, ry * u, 0, 0, TAU)
+        ctx.strokeStyle = 'rgba(255,77,58,0.95)'
+        ctx.lineWidth = 4 * dpr
+        ctx.stroke()
+        // Crosshair.
+        ctx.strokeStyle = 'rgba(255,193,77,0.7)'
         ctx.lineWidth = 2 * dpr
+        ctx.beginPath()
+        ctx.moveTo(s.x - r * 0.25, s.y)
+        ctx.lineTo(s.x + r * 0.25, s.y)
+        ctx.moveTo(s.x, s.y - ry * 0.25)
+        ctx.lineTo(s.x, s.y + ry * 0.25)
         ctx.stroke()
       } else if (ev.kind === 'hole') {
-        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r)
-        g.addColorStop(0, 'rgba(0,0,0,0.9)')
-        g.addColorStop(1, 'rgba(60,20,90,0.35)')
+        this.vortex(s.x, s.y, r, '#b388ff', this.clock)
+        if (Math.random() < 0.4) {
+          const a = Math.random() * TAU
+          const d = ev.r * 1.1
+          this.add({ kind: 'spark', x: ev.x + Math.cos(a) * d, y: ev.y + Math.sin(a) * d, z: 2, vx: -Math.cos(a + 0.6) * d * 1.6, vy: -Math.sin(a + 0.6) * d * 1.6, size: 1.6, color: '#b388ff', life: 0.6, drag: 1 })
+        }
+      } else if (ev.kind === 'orb' && !ev.fired) {
         ctx.beginPath()
-        ctx.arc(s.x, s.y, r, 0, TAU)
-        ctx.fillStyle = g
+        ctx.ellipse(s.x, s.y, 14 * Z, 14 * Z * TILT, 0, 0, TAU)
+        ctx.fillStyle = 'rgba(0,0,0,0.35)'
         ctx.fill()
-        ctx.strokeStyle = '#b388ff'
+        ctx.globalCompositeOperation = 'lighter'
+        ctx.beginPath()
+        ctx.ellipse(s.x, s.y, ev.r * Z, ev.r * Z * TILT, 0, 0, TAU)
+        ctx.strokeStyle = hexA('#ffc14d', 0.4 + Math.sin(this.clock * 6) * 0.2)
         ctx.lineWidth = 2 * dpr
         ctx.stroke()
       }
@@ -1101,85 +1859,260 @@ export class Renderer {
     }
     for (const well of match.wells) {
       const s = project(well.x, well.y)
-      const r = well.r * zoom
+      const r = well.r * Z
       ctx.save()
-      ctx.strokeStyle = 'rgba(179,136,255,0.7)'
-      ctx.lineWidth = 2 * dpr
-      for (let i = 0; i < 3; i++) {
-        const u = ((this.clock * 0.8 + i / 3) % 1)
+      ctx.globalCompositeOperation = 'lighter'
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r)
+      g.addColorStop(0, 'rgba(179,136,255,0.35)')
+      g.addColorStop(1, 'rgba(179,136,255,0)')
+      ctx.fillStyle = g
+      ctx.beginPath()
+      ctx.ellipse(s.x, s.y, r, r * TILT, 0, 0, TAU)
+      ctx.fill()
+      ctx.strokeStyle = 'rgba(179,136,255,0.8)'
+      ctx.lineWidth = 2.5 * dpr
+      for (let i = 0; i < 4; i++) {
+        const u = (this.clock * 0.9 + i / 4) % 1
         ctx.globalAlpha = u
+        const rr = r * (1 - u) + 4
         ctx.beginPath()
-        ctx.arc(s.x, s.y, r * (1 - u) + 4, 0, TAU)
+        ctx.ellipse(s.x, s.y, rr, rr * TILT, 0, 0, TAU)
         ctx.stroke()
       }
       ctx.restore()
     }
   }
 
-  private zone(match: Match, project: Project, zoom: number): void {
+  private uprightEvents(match: Match, project: Project, items: DrawItem[]): void {
+    const ctx = this.ctx
+    const Z = this.Z
+    for (const ev of match.live) {
+      if (ev.kind === 'meteor' && !ev.fired) {
+        items.push({
+          y: ev.y + 1000,
+          draw: () => {
+            const u = clamp((match.time - ev.born) / Math.max(0.01, ev.dur), 0, 1)
+            const fall = (1 - u) * (1 - u)
+            const z = fall * 900
+            const x = ev.x + fall * 380
+            const s = project(x, ev.y - fall * 120, z)
+            const tail = project(x + 260, ev.y - fall * 120 - 90, z + 600)
+            ctx.save()
+            ctx.globalCompositeOperation = 'lighter'
+            const g = ctx.createLinearGradient(tail.x, tail.y, s.x, s.y)
+            g.addColorStop(0, 'rgba(255,120,60,0)')
+            g.addColorStop(1, 'rgba(255,210,140,0.95)')
+            ctx.strokeStyle = g
+            ctx.lineWidth = 22 * Z
+            ctx.lineCap = 'round'
+            ctx.beginPath()
+            ctx.moveTo(tail.x, tail.y)
+            ctx.lineTo(s.x, s.y)
+            ctx.stroke()
+            const glow = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, 60 * Z)
+            glow.addColorStop(0, 'rgba(255,230,170,0.95)')
+            glow.addColorStop(1, 'rgba(255,90,30,0)')
+            ctx.fillStyle = glow
+            ctx.fillRect(s.x - 60 * Z, s.y - 60 * Z, 120 * Z, 120 * Z)
+            ctx.restore()
+            ctx.beginPath()
+            ctx.arc(s.x, s.y, 16 * Z, 0, TAU)
+            ctx.fillStyle = '#3a2420'
+            ctx.fill()
+            ctx.strokeStyle = '#ffb36b'
+            ctx.lineWidth = 3 * this.dpr
+            ctx.stroke()
+          },
+        })
+      } else if (ev.kind === 'orb' && !ev.fired) {
+        items.push({
+          y: ev.y,
+          draw: () => {
+            const bob = Math.sin(this.clock * 4) * 6
+            const s = project(ev.x, ev.y, 34 + bob)
+            const r = 12 * Z
+            ctx.save()
+            ctx.globalCompositeOperation = 'lighter'
+            const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * 4)
+            g.addColorStop(0, 'rgba(255,193,77,0.7)')
+            g.addColorStop(1, 'rgba(255,193,77,0)')
+            ctx.fillStyle = g
+            ctx.fillRect(s.x - r * 4, s.y - r * 4, r * 8, r * 8)
+            ctx.restore()
+            ctx.save()
+            ctx.translate(s.x, s.y)
+            const spin = Math.cos(this.clock * 3)
+            ctx.scale(Math.max(0.2, Math.abs(spin)), 1)
+            ctx.beginPath()
+            ctx.moveTo(0, -r * 1.3)
+            ctx.lineTo(r, 0)
+            ctx.lineTo(0, r * 1.3)
+            ctx.lineTo(-r, 0)
+            ctx.closePath()
+            const gg = ctx.createLinearGradient(-r, -r, r, r)
+            gg.addColorStop(0, '#fff6d0')
+            gg.addColorStop(0.5, '#ffc14d')
+            gg.addColorStop(1, '#c47a00')
+            ctx.fillStyle = gg
+            ctx.fill()
+            ctx.strokeStyle = '#fff'
+            ctx.lineWidth = 2 * this.dpr
+            ctx.stroke()
+            ctx.restore()
+          },
+        })
+      }
+    }
+  }
+
+  private zone(match: Match, project: Project): void {
     if (!match.zone) return
     const ctx = this.ctx
     const s = project(match.zone.x, match.zone.y)
-    const r = match.zone.r * zoom
+    const r = match.zone.r * this.Z
+    const ry = r * TILT
+    const H = 90 * this.Z
+    const owners = match.players.filter((p) => p.alive && Math.hypot(p.x - match.zone!.x, p.y - match.zone!.y) < match.zone!.r)
+    const col = owners.length === 1 ? owners[0]!.color : '#ffc14d'
     ctx.save()
     const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r)
-    g.addColorStop(0, 'rgba(255,193,77,0.04)')
-    g.addColorStop(1, 'rgba(255,193,77,0.2)')
+    g.addColorStop(0, hexA(col, 0.06))
+    g.addColorStop(1, hexA(col, 0.26))
     ctx.beginPath()
-    ctx.arc(s.x, s.y, r, 0, TAU)
+    ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
     ctx.fillStyle = g
     ctx.fill()
-    ctx.setLineDash([14 * this.dpr, 8 * this.dpr])
-    ctx.lineDashOffset = -this.clock * 30
-    ctx.strokeStyle = '#ffc14d'
-    ctx.lineWidth = 3 * this.dpr
+    ctx.setLineDash([16 * this.dpr, 10 * this.dpr])
+    ctx.lineDashOffset = -this.clock * 40
+    ctx.strokeStyle = col
+    ctx.lineWidth = 3.5 * this.dpr
     ctx.stroke()
+    ctx.setLineDash([])
+    // Light curtain rising from the edge.
+    ctx.globalCompositeOperation = 'lighter'
+    const cg = ctx.createLinearGradient(0, s.y - H, 0, s.y + ry)
+    cg.addColorStop(0, hexA(col, 0))
+    cg.addColorStop(1, hexA(col, 0.22))
+    ctx.fillStyle = cg
+    ctx.beginPath()
+    ctx.ellipse(s.x, s.y, r, ry, 0, 0, Math.PI)
+    ctx.lineTo(s.x - r, s.y - H)
+    ctx.ellipse(s.x, s.y - H, r, ry, 0, Math.PI, TAU)
+    ctx.closePath()
+    ctx.fill()
     ctx.restore()
   }
 
-  // ---------------------------------------------------------------- balls
+  // ================================================================ balls
 
   private fxFor(b: Body): BallFx {
     let fx = this.balls.get(b.id)
     if (!fx) {
+      let seed = 0
+      for (let i = 0; i < b.id.length; i++) seed = (seed * 31 + b.id.charCodeAt(i)) % 997
       fx = {
-        squash: 0, squashV: 0, squashAng: 0, land: 0, roll: 0,
-        vx: 0, vy: 0,
-        ghosts: [], ghostTimer: 0, emberTimer: 0,
+        squash: 0, squashV: 0, squashAng: 0, land: 0,
+        lookX: 0, lookY: 0.2, hurt: 0, focus: 0, idle: 0,
+        ghosts: [], ghostTimer: 0, emberTimer: 0, smokeTimer: 0, zzzTimer: 0,
+        drop: 0, dropDelay: 0, lastX: b.x, lastY: b.y, seed: seed / 997, perfect: 0,
       }
       this.balls.set(b.id, fx)
     }
     return fx
   }
 
-  private track(b: Body, dt: number): void {
+  private zOf(b: Body): number {
+    const fx = this.balls.get(b.id)
+    const h = b.falling ? b.fallHeight : b.height
+    const drop = fx && fx.drop > 0 ? easeInCubic(fx.drop) * 820 : 0
+    return h + drop
+  }
+
+  private track(b: Body, dt: number, match: Match, prefs: RenderPrefs): void {
     const fx = this.fxFor(b)
-    fx.vx = b.vx
-    fx.vy = b.vy
     // Damped spring back to round, like a rubber ball.
     fx.squashV += (-420 * fx.squash - 16 * fx.squashV) * dt
     fx.squash = clamp(fx.squash + fx.squashV * dt, -0.4, 0.4)
     fx.land = Math.max(0, fx.land - dt * 6)
-    fx.roll += (Math.hypot(b.vx, b.vy) / Math.max(4, b.radius)) * dt * (b.vx >= 0 ? 1 : -1)
+    fx.hurt = Math.max(0, fx.hurt - dt)
+    fx.focus = Math.max(0, fx.focus - dt)
+    fx.perfect = Math.max(0, fx.perfect - dt)
+    if (fx.dropDelay > 0) fx.dropDelay -= dt
+    else if (fx.drop > 0) {
+      fx.drop = Math.max(0, fx.drop - dt / 0.42)
+      if (fx.drop === 0) {
+        fx.land = 1.6
+        fx.squashAng = Math.PI / 2
+        fx.squashV -= 6
+        this.ring(b.x, b.y, b.color, 60, 0.45, 5)
+        if (prefs.fx === 'full') {
+          for (let i = 0; i < 8; i++) {
+            const a = (i / 8) * TAU + Math.random() * 0.6
+            const sp = 120 + Math.random() * 90
+            this.add({ kind: 'puff', x: b.x, y: b.y, z: 2, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, size: 6 + Math.random() * 5, color: '#dfe9f5', life: 0.4 + Math.random() * 0.2, drag: 5 })
+          }
+        }
+        if (!match.silent) this.trauma = Math.min(1, this.trauma + 0.05 * prefs.shake)
+      }
+    }
+    const speed = Math.hypot(b.vx, b.vy)
+    // Face turns toward travel, settling back to the camera when slow.
+    const k = clamp(speed / 320, 0, 1) * 0.95
+    const tx = speed > 1 ? (b.vx / speed) * k : 0
+    const ty = speed > 1 ? (b.vy / speed) * k * TILT : 0.2
+    const ease = 1 - Math.exp(-8 * dt)
+    fx.lookX = lerp(fx.lookX, tx, ease)
+    fx.lookY = lerp(fx.lookY, speed > 40 ? ty : 0.2, ease)
+    fx.idle = speed < 6 && !b.bot ? fx.idle + dt : 0
     if (fx.ghostTimer > 0) {
       fx.ghostTimer -= dt
-      fx.ghosts.push({ x: b.x, y: b.y, life: 0.22 })
+      fx.ghosts.push({ x: b.x, y: b.y, z: this.zOf(b), life: 0.24 })
     }
     for (const g of fx.ghosts) g.life -= dt
     fx.ghosts = fx.ghosts.filter((g) => g.life > 0)
-    if (b.trail === 'trail_ember' && Math.hypot(b.vx, b.vy) > 260) {
+    if (b.trail === 'trail_ember' && speed > 260) {
       fx.emberTimer -= dt
       if (fx.emberTimer <= 0) {
         fx.emberTimer = 0.03
         const a = Math.atan2(b.vy, b.vx) + Math.PI + (Math.random() - 0.5) * 0.8
-        this.add('ember', b.x, b.y, Math.cos(a) * 60, Math.sin(a) * 60 - 20, 2 + Math.random() * 2, Math.random() < 0.5 ? '#ffc14d' : '#ff6a2a', 0.5, 2)
+        this.add({ kind: 'ember', x: b.x, y: b.y, z: this.zOf(b) + b.radius, vx: Math.cos(a) * 60, vy: Math.sin(a) * 60, vz: 40, size: 2 + Math.random() * 2, color: Math.random() < 0.5 ? '#ffc14d' : '#ff6a2a', life: 0.5, drag: 2 })
       }
     }
+    if (b.heat > 110 && !b.decoy && prefs.fx === 'full' && !b.falling) {
+      fx.smokeTimer -= dt
+      if (fx.smokeTimer <= 0) {
+        fx.smokeTimer = clamp(0.22 - (b.heat - 110) / 700, 0.05, 0.22)
+        this.add({ kind: b.heat > 170 ? 'ember' : 'smoke', x: b.x + (Math.random() - 0.5) * b.radius, y: b.y, z: this.zOf(b) + b.radius * 1.6, vx: (Math.random() - 0.5) * 20, vy: 0, vz: 50 + Math.random() * 40, size: b.heat > 170 ? 2.5 : 6 + Math.random() * 5, color: b.heat > 170 ? '#ff8a3a' : '#9aa2b4', life: 0.8, drag: 1 })
+      }
+    }
+    if (fx.idle > 6 && match.status !== 'countdown') {
+      fx.zzzTimer -= dt
+      if (fx.zzzTimer <= 0) {
+        fx.zzzTimer = 0.9
+        this.add({ kind: 'zzz', x: b.x, y: b.y, z: b.radius * 2.2, vx: 14, vz: 30, size: 14, color: '#cfe2ff', life: 1.4, drag: 0.5, text: 'z' })
+      }
+    }
+    fx.lastX = b.x
+    fx.lastY = b.y
   }
 
-  private trail(b: Body, project: Project, zoom: number): void {
+  private expressionFor(b: Body, fx: BallFx, match: Match): Expression {
+    if (match.status === 'celebrate' || match.status === 'finished') {
+      if (match.winnerIds.includes(b.id)) return 'happy'
+    }
+    if (b.emoteTime > 0) return 'happy'
+    if (fx.hurt > 0 || b.hitFlash > 0.55) return 'hurt'
+    if (fx.drop > 0.02) return 'scared'
+    const outward = b.vx * -b.safetyX + b.vy * -b.safetyY
+    if (b.falling || (b.edgeDist < 60 && b.edgeDist > -40 && outward > 60) || b.heat > 160) return 'scared'
+    if (fx.idle > 6) return 'sleep'
+    if (b.dashTime > 0 || fx.focus > 0 || b.momentum > 0.82 || b.overdriveTime > 0 || b.anchorTime > 0) return 'focus'
+    return 'idle'
+  }
+
+  private trail(b: Body, project: Project): void {
     const speed = Math.hypot(b.vx, b.vy)
-    if (speed < 90 || b.trail === 'trail_none' || b.trail === 'trail_ember') return
+    if (speed < 100 || b.trail === 'trail_none' || b.trail === 'trail_ember') return
     const ctx = this.ctx
     const pts: { x: number; y: number }[] = []
     const n = b.hist.length / 2
@@ -1194,10 +2127,10 @@ export class Renderer {
     }
     pts.push({ x: b.x, y: b.y })
     if (pts.length < 3) return
-    const sp = pts.map((p) => project(p.x, p.y))
-    const lift = Math.max(0, b.height) * zoom * 0.85
-    const a0 = clamp((speed - 90) / 600, 0.1, 0.85)
-    const r = b.radius * zoom
+    const z = this.zOf(b) + b.radius
+    const sp = pts.map((p) => project(p.x, p.y, z))
+    const a0 = clamp((speed - 100) / 560, 0.1, 0.9)
+    const r = b.radius * this.Z
     ctx.save()
     ctx.globalCompositeOperation = 'lighter'
     ctx.lineCap = 'round'
@@ -1207,11 +2140,11 @@ export class Renderer {
     if (kind === 'trail_ribbon') {
       for (let i = 1; i < m; i++) {
         const u = i / (m - 1)
-        ctx.strokeStyle = hexA(b.color, a0 * u * 0.6)
-        ctx.lineWidth = r * 1.7
+        ctx.strokeStyle = hexA(b.color, a0 * u * 0.55)
+        ctx.lineWidth = r * 1.8
         ctx.beginPath()
-        ctx.moveTo(sp[i - 1]!.x, sp[i - 1]!.y - lift)
-        ctx.lineTo(sp[i]!.x, sp[i]!.y - lift)
+        ctx.moveTo(sp[i - 1]!.x, sp[i - 1]!.y)
+        ctx.lineTo(sp[i]!.x, sp[i]!.y)
         ctx.stroke()
       }
     } else if (kind === 'trail_ion') {
@@ -1223,14 +2156,14 @@ export class Renderer {
           const dx = next.x - prev.x
           const dy = next.y - prev.y
           const l = Math.hypot(dx, dy) || 1
-          const px = (-dy / l) * r * 0.55 * side
-          const py = (dx / l) * r * 0.55 * side
+          const px = (-dy / l) * r * 0.6 * side
+          const py = (dx / l) * r * 0.6 * side
           const q = sp[i]!
-          if (i === 0) ctx.moveTo(q.x + px, q.y + py - lift)
-          else ctx.lineTo(q.x + px, q.y + py - lift)
+          if (i === 0) ctx.moveTo(q.x + px, q.y + py)
+          else ctx.lineTo(q.x + px, q.y + py)
         }
         ctx.strokeStyle = hexA(mixHex(b.color, '#ffffff', 0.4), a0)
-        ctx.lineWidth = 1.6 * this.dpr
+        ctx.lineWidth = 2 * this.dpr
         ctx.stroke()
       }
     } else if (kind === 'trail_spark') {
@@ -1239,10 +2172,10 @@ export class Renderer {
         const j = Math.sin(i * 12.9898 + Math.floor(this.clock * 30) * 78.233) * r * 0.9
         const k = Math.cos(i * 4.1414 + Math.floor(this.clock * 30) * 12.3) * r * 0.9
         ctx.strokeStyle = hexA(i % 2 ? '#ffffff' : b.color, a0 * (i / m))
-        ctx.lineWidth = 1.5 * this.dpr
+        ctx.lineWidth = 1.8 * this.dpr
         ctx.beginPath()
-        ctx.moveTo(q.x, q.y - lift)
-        ctx.lineTo(q.x + j, q.y + k - lift)
+        ctx.moveTo(q.x, q.y)
+        ctx.lineTo(q.x + j, q.y + k)
         ctx.stroke()
       }
     } else if (kind === 'trail_hex') {
@@ -1250,12 +2183,12 @@ export class Renderer {
         const q = sp[i]!
         const u = i / m
         ctx.strokeStyle = hexA(b.color, a0 * u)
-        ctx.lineWidth = 1.5 * this.dpr
+        ctx.lineWidth = 1.8 * this.dpr
         ctx.beginPath()
         for (let k = 0; k <= 6; k++) {
           const a = (k / 6) * TAU + i
-          const rr = r * (0.3 + u * 0.4)
-          ctx.lineTo(q.x + Math.cos(a) * rr, q.y + Math.sin(a) * rr - lift)
+          const rr = r * (0.3 + u * 0.45)
+          ctx.lineTo(q.x + Math.cos(a) * rr, q.y + Math.sin(a) * rr)
         }
         ctx.stroke()
       }
@@ -1263,68 +2196,153 @@ export class Renderer {
       // Comet: tapered, hot at the head.
       for (let i = 1; i < m; i++) {
         const u = i / (m - 1)
-        ctx.strokeStyle = hexA(mixHex(b.color, '#ffffff', u * 0.35), a0 * u)
-        ctx.lineWidth = Math.max(1, r * 1.5 * u)
+        ctx.strokeStyle = hexA(mixHex(b.color, '#ffffff', u * 0.4), a0 * u * 0.9)
+        ctx.lineWidth = Math.max(1, r * 1.6 * u)
         ctx.beginPath()
-        ctx.moveTo(sp[i - 1]!.x, sp[i - 1]!.y - lift)
-        ctx.lineTo(sp[i]!.x, sp[i]!.y - lift)
+        ctx.moveTo(sp[i - 1]!.x, sp[i - 1]!.y)
+        ctx.lineTo(sp[i]!.x, sp[i]!.y)
         ctx.stroke()
       }
     }
     ctx.restore()
   }
 
-  private ghosts(b: Body, project: Project, zoom: number): void {
+  private ghosts(b: Body, project: Project): void {
     const fx = this.balls.get(b.id)
     if (!fx || fx.ghosts.length === 0) return
     const ctx = this.ctx
     ctx.save()
     ctx.globalCompositeOperation = 'lighter'
     for (const g of fx.ghosts) {
-      const s = project(g.x, g.y)
-      const u = g.life / 0.22
-      ctx.globalAlpha = u * 0.35
+      const s = project(g.x, g.y, g.z + b.radius)
+      const u = g.life / 0.24
+      ctx.globalAlpha = u * 0.32
       ctx.beginPath()
-      ctx.arc(s.x, s.y - Math.max(0, b.height) * zoom * 0.85, b.radius * zoom * (0.7 + u * 0.3), 0, TAU)
+      ctx.arc(s.x, s.y, b.radius * this.Z * (0.7 + u * 0.3), 0, TAU)
       ctx.fillStyle = b.color
       ctx.fill()
     }
     ctx.restore()
   }
 
-  private shadow(x: number, y: number, r: number, lift: number): void {
+  private shadow(b: Body, project: Project, lift: number): void {
+    if (b.falling && b.fallHeight < 0) return
     const ctx = this.ctx
-    const spread = 1 + lift / 160
+    const s = project(b.x, b.y)
+    const r = b.radius * this.Z * (b.decoy ? 0.85 : 1)
+    const spread = 1 + Math.max(0, lift) / 140
+    const a = clamp(0.5 - Math.max(0, lift) / 400, 0.06, 0.5)
+    const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * spread)
+    g.addColorStop(0, `rgba(0,0,8,${a})`)
+    g.addColorStop(0.7, `rgba(0,0,8,${a * 0.6})`)
+    g.addColorStop(1, 'rgba(0,0,8,0)')
+    ctx.fillStyle = g
     ctx.beginPath()
-    ctx.ellipse(x, y + r * 0.15, r * 0.9 * spread, r * 0.42 * spread, 0, 0, TAU)
-    ctx.fillStyle = `rgba(0,0,0,${clamp(0.42 - lift / 300, 0.1, 0.42)})`
+    ctx.ellipse(s.x, s.y, r * spread * 1.05, r * spread * TILT * 0.75, 0, 0, TAU)
     ctx.fill()
   }
 
-  private drawBall(b: Body, project: Project, zoom: number, prefs: RenderPrefs): void {
+  /** Floor ring under your ball: speed arc, dash pips and the steer arrow. */
+  private localMarker(b: Body, project: Project): void {
+    if (b.falling) return
+    const ctx = this.ctx
+    const s = project(b.x, b.y)
+    const r = (b.radius + 9) * this.Z
+    const ry = r * TILT
+    const dpr = this.dpr
+    ctx.save()
+    ctx.beginPath()
+    ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)'
+    ctx.lineWidth = 5 * dpr
+    ctx.stroke()
+    if (b.momentum > 0.02) {
+      const col = mixHex('#3ee6a0', '#ff4d3a', b.momentum)
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.beginPath()
+      ctx.ellipse(s.x, s.y, r, ry, 0, -Math.PI / 2, -Math.PI / 2 + TAU * b.momentum)
+      ctx.strokeStyle = col
+      ctx.lineWidth = 3.5 * dpr
+      ctx.lineCap = 'round'
+      ctx.stroke()
+      ctx.globalCompositeOperation = 'source-over'
+    }
+    const m = Math.hypot(b.input.x, b.input.y)
+    if (m > 0.2) {
+      const ax = b.input.x / m
+      const ay = b.input.y / m
+      const ready = b.dashCd <= 0
+      const d0 = b.radius + 16
+      const tip = project(b.x + ax * (d0 + 16), b.y + ay * (d0 + 16))
+      const l = project(b.x + ax * d0 - ay * 9, b.y + ay * d0 + ax * 9)
+      const rr = project(b.x + ax * d0 + ay * 9, b.y + ay * d0 - ax * 9)
+      const mid = project(b.x + ax * (d0 + 5), b.y + ay * (d0 + 5))
+      ctx.beginPath()
+      ctx.moveTo(tip.x, tip.y)
+      ctx.lineTo(l.x, l.y)
+      ctx.lineTo(mid.x, mid.y)
+      ctx.lineTo(rr.x, rr.y)
+      ctx.closePath()
+      ctx.fillStyle = ready ? hexA('#ffffff', 0.85 * m) : hexA('#ffffff', 0.35 * m)
+      ctx.fill()
+    }
+    ctx.restore()
+  }
+
+  private drawBall(b: Body, project: Project, prefs: RenderPrefs, match: Match): void {
     const ctx = this.ctx
     const fx = this.fxFor(b)
-    const p = project(b.x, b.y)
-    const h = b.falling ? b.fallHeight : b.height
-    const lift = h * zoom * 0.85
-    let r = b.radius * zoom * (1 + Math.max(0, lift) * 0.0016)
+    if (fx.dropDelay > 0) return
+    const z = this.zOf(b)
+    let r = b.radius * this.Z
+    const p = project(b.x, b.y, z + b.radius)
     // During hitstop the struck ball shudders in place, which sells the freeze.
     const shudder = this.hitstop > 0 && b.id === this.jitterId && !prefs.reducedMotion ? 3 * this.dpr : 0
     const x = p.x + (shudder ? (Math.random() - 0.5) * 2 * shudder : 0)
-    const y = p.y - lift + (shudder ? (Math.random() - 0.5) * 2 * shudder : 0)
+    const y = p.y + (shudder ? (Math.random() - 0.5) * 2 * shudder : 0)
     let sink = 0
     if (b.falling && b.fallHeight < 0) {
-      sink = clamp(-b.fallHeight / 32, 0, 1)
-      r *= 1 - sink * 0.45
+      sink = clamp(-b.fallHeight / 40, 0, 1)
+      r *= 1 - sink * 0.25
     }
     ctx.save()
-    if (b.phaseTime > 0) ctx.globalAlpha = 0.45
-    if (b.decoy) ctx.globalAlpha = 0.7
+    if (b.phaseTime > 0) ctx.globalAlpha = 0.4 + Math.sin(this.clock * 30) * 0.1
+    if (b.decoy) ctx.globalAlpha = 0.75
+    if (b.invuln > 0 && !b.decoy && Math.sin(this.clock * 28) > 0.3) ctx.globalAlpha *= 0.65
+
+    // Heat glow behind the ball: warmer and faster as it gets easier to launch.
+    if (b.heat > 35 && !b.decoy) {
+      const k = clamp((b.heat - 35) / 150, 0, 1)
+      const beat = prefs.reducedMotion ? 0.5 : 0.5 + Math.sin(this.clock * (4 + k * 10)) * 0.5
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      const R = r + (12 + k * 20) * this.dpr
+      const glow = ctx.createRadialGradient(x, y, r * 0.7, x, y, R)
+      glow.addColorStop(0, hexA(heatColor(b.heat), (0.25 + k * 0.35) * (0.6 + beat * 0.4)))
+      glow.addColorStop(1, hexA(heatColor(b.heat), 0))
+      ctx.fillStyle = glow
+      ctx.beginPath()
+      ctx.arc(x, y, R, 0, TAU)
+      ctx.fill()
+      ctx.restore()
+    }
+    if (b.overdriveTime > 0 || fx.perfect > 0) {
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      const R = r * 1.9
+      const glow = ctx.createRadialGradient(x, y, r * 0.6, x, y, R)
+      glow.addColorStop(0, hexA('#ffc14d', 0.45))
+      glow.addColorStop(1, hexA('#ffc14d', 0))
+      ctx.fillStyle = glow
+      ctx.fillRect(x - R, y - R, R * 2, R * 2)
+      ctx.restore()
+    }
+
     ctx.translate(x, y)
     ctx.save()
     const speed = Math.hypot(b.vx, b.vy)
-    const stretch = prefs.reducedMotion ? 0 : Math.min(0.22, (speed / SPEED_CAP) * 0.26)
-    const va = Math.atan2(b.vy, b.vx)
+    const stretch = prefs.reducedMotion ? 0 : Math.min(0.24, (speed / SPEED_CAP) * 0.28)
+    const va = Math.atan2(b.vy * TILT, b.vx)
     ctx.rotate(va)
     ctx.scale(1 + stretch, 1 / (1 + stretch))
     ctx.rotate(-va)
@@ -1334,226 +2352,115 @@ export class Renderer {
       ctx.rotate(-fx.squashAng)
     }
     if (fx.land > 0 && !prefs.reducedMotion) {
-      const l = Math.sin(Math.min(1, fx.land) * Math.PI) * 0.16
+      const l = Math.sin(Math.min(1, fx.land) * Math.PI) * 0.18
+      ctx.translate(0, r * l)
       ctx.scale(1 + l, 1 - l)
     }
-
-    const skinMix = b.skin === 'glass' ? 0.35 : b.skin === 'chrome' ? 0.2 : 0.08
-    const g = ctx.createRadialGradient(-r * 0.35, -r * 0.42, r * 0.1, 0, 0, r)
-    g.addColorStop(0, mixHex(b.color, '#ffffff', 0.55 + skinMix))
-    g.addColorStop(0.5, b.color)
-    g.addColorStop(1, mixHex(b.color, '#000000', b.skin === 'hollow' ? 0.15 : 0.5))
-    ctx.beginPath()
-    ctx.arc(0, 0, r, 0, TAU)
-    if (b.skin !== 'hollow') {
-      ctx.fillStyle = g
-      ctx.fill()
-    }
-    ctx.save()
-    ctx.clip()
-    ctx.rotate(fx.roll * 0.35)
-    this.pattern(b.pattern + (prefs.colorblind ? 1 : 0), 0, 0, r)
-    ctx.restore()
-    // Rim light from below, then the specular highlight.
-    ctx.beginPath()
-    ctx.arc(0, 0, r * 0.92, 0.2, Math.PI - 0.2)
-    ctx.strokeStyle = hexA(mixHex(b.color, '#ffffff', 0.5), 0.45)
-    ctx.lineWidth = Math.max(1, r * 0.1)
-    ctx.stroke()
-    ctx.beginPath()
-    ctx.ellipse(-r * 0.3, -r * 0.38, r * 0.3, r * 0.15, -0.6, 0, TAU)
-    ctx.fillStyle = 'rgba(255,255,255,0.5)'
-    ctx.fill()
-    ctx.beginPath()
-    ctx.arc(-r * 0.12, -r * 0.55, r * 0.06, 0, TAU)
-    ctx.fillStyle = 'rgba(255,255,255,0.8)'
-    ctx.fill()
-    ctx.beginPath()
-    ctx.arc(0, 0, r, 0, TAU)
-    ctx.lineWidth = (b.skin === 'hollow' ? 4 : 2) * this.dpr
-    ctx.strokeStyle = mixHex(b.color, '#000000', 0.45)
-    ctx.stroke()
-    if (b.hitFlash > 0.5) {
-      ctx.fillStyle = `rgba(255,255,255,${(b.hitFlash - 0.5) * 1.8})`
-      ctx.fill()
-    }
-    if (sink > 0) {
-      ctx.fillStyle = `rgba(2,4,10,${sink * 0.75})`
-      ctx.fill()
-    }
+    if (fx.drop > 0 && !prefs.reducedMotion) ctx.scale(0.85, 1.2)
+    paintBall(ctx, 0, 0, r, {
+      color: b.color,
+      skin: b.skin,
+      pattern: b.pattern,
+      colorblind: prefs.colorblind,
+      lookX: fx.lookX,
+      lookY: fx.lookY,
+      expression: b.decoy ? 'idle' : this.expressionFor(b, fx, match),
+      blink: blinkAt(this.clock, fx.seed),
+      time: this.clock,
+      heat: b.heat,
+      flash: b.hitFlash > 0.5 ? (b.hitFlash - 0.5) * 2 : 0,
+      sink,
+      face: !b.decoy,
+      dpr: this.dpr,
+    })
     ctx.restore()
 
-    if (!b.decoy && !b.falling) this.auras(b, r, prefs)
+    if (!b.decoy && !b.falling) this.auras(b, r)
     ctx.restore()
   }
 
-  private auras(b: Body, r: number, prefs: RenderPrefs): void {
+  private auras(b: Body, r: number): void {
     const ctx = this.ctx
     const dpr = this.dpr
     const T = this.clock
-    const ringR = r + 7 * dpr
     ctx.lineCap = 'round'
-    if (b.heat > 40) {
-      // Heat glow: warmer and faster as the ball gets easier to launch.
-      const k = clamp((b.heat - 40) / 140, 0, 1)
-      const beat = prefs.reducedMotion ? 0.5 : 0.5 + Math.sin(T * (4 + k * 10)) * 0.5
-      ctx.save()
-      ctx.globalCompositeOperation = 'lighter'
-      const glow = ctx.createRadialGradient(0, 0, r * 0.8, 0, 0, r + (10 + k * 16) * dpr)
-      glow.addColorStop(0, hexA(heatColor(b.heat), 0))
-      glow.addColorStop(0.55, hexA(heatColor(b.heat), (0.18 + k * 0.32) * (0.6 + beat * 0.4)))
-      glow.addColorStop(1, hexA(heatColor(b.heat), 0))
-      ctx.fillStyle = glow
-      ctx.beginPath()
-      ctx.arc(0, 0, r + (10 + k * 16) * dpr, 0, TAU)
-      ctx.fill()
-      ctx.restore()
-    }
-    ctx.beginPath()
-    ctx.arc(0, 0, ringR, 0, TAU)
-    ctx.strokeStyle = 'rgba(0,0,0,0.35)'
-    ctx.lineWidth = 3.5 * dpr
-    ctx.stroke()
-    if (b.momentum > 0.01) {
-      const col = mixHex('#3ee6a0', '#ff4d3a', b.momentum)
-      if (b.momentum > 0.85) {
-        ctx.save()
-        ctx.globalCompositeOperation = 'lighter'
-        ctx.beginPath()
-        ctx.arc(0, 0, ringR, 0, TAU)
-        ctx.strokeStyle = hexA(col, 0.25 + Math.sin(T * 14) * 0.12)
-        ctx.lineWidth = 9 * dpr
-        ctx.stroke()
-        ctx.restore()
-      }
-      ctx.beginPath()
-      ctx.arc(0, 0, ringR, -Math.PI / 2, -Math.PI / 2 + TAU * b.momentum)
-      ctx.strokeStyle = col
-      ctx.lineWidth = 3 * dpr
-      ctx.stroke()
-    }
-    if (b.dashCd <= 0) {
-      const a = T * 2.4
-      ctx.fillStyle = '#ffffff'
-      ctx.beginPath()
-      ctx.arc(Math.cos(a) * ringR, Math.sin(a) * ringR, 2.6 * dpr, 0, TAU)
-      ctx.fill()
-    }
     if (b.invuln > 0) {
       ctx.save()
       ctx.globalCompositeOperation = 'lighter'
-      ctx.setLineDash([4 * dpr, 5 * dpr])
-      ctx.lineDashOffset = -T * 30
+      const g = ctx.createRadialGradient(0, 0, r * 0.9, 0, 0, r + 10 * dpr)
+      g.addColorStop(0, hexA('#7ee0ff', 0))
+      g.addColorStop(0.7, hexA('#7ee0ff', 0.35 + Math.sin(T * 12) * 0.15))
+      g.addColorStop(1, hexA('#7ee0ff', 0))
+      ctx.fillStyle = g
       ctx.beginPath()
-      ctx.arc(0, 0, r + 11 * dpr, 0, TAU)
-      ctx.strokeStyle = hexA('#7ee0ff', 0.5 + Math.sin(T * 12) * 0.25)
-      ctx.lineWidth = 2 * dpr
-      ctx.stroke()
+      ctx.arc(0, 0, r + 10 * dpr, 0, TAU)
+      ctx.fill()
       ctx.restore()
     }
     if (b.overdriveTime > 0) {
       ctx.save()
       ctx.globalCompositeOperation = 'lighter'
       for (let i = 0; i < 6; i++) {
-        const a = T * 6 + (i * TAU) / 6
+        const a = T * 7 + (i * TAU) / 6
         ctx.beginPath()
-        ctx.arc(0, 0, r + 4 * dpr, a, a + 0.5)
-        ctx.strokeStyle = hexA('#ffc14d', 0.8)
+        ctx.arc(0, 0, r + 5 * dpr, a, a + 0.5)
+        ctx.strokeStyle = hexA('#ffc14d', 0.85)
         ctx.lineWidth = 3 * dpr
         ctx.stroke()
       }
       ctx.restore()
     }
     if (b.anchorTime > 0 || b.mirrorTime > 0) {
-      ctx.strokeStyle = b.mirrorTime > 0 ? '#7ee0ff' : '#f4f7fb'
+      const mirror = b.mirrorTime > 0
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.strokeStyle = mirror ? '#7ee0ff' : '#f4f7fb'
+      ctx.fillStyle = mirror ? 'rgba(126,224,255,0.12)' : 'rgba(244,247,251,0.1)'
       ctx.lineWidth = 2.5 * dpr
       ctx.beginPath()
-      const sides = b.mirrorTime > 0 ? 6 : 4
+      const sides = mirror ? 6 : 4
       for (let i = 0; i <= sides; i++) {
         const a = (i / sides) * TAU + T * 0.8
-        ctx.lineTo(Math.cos(a) * (r + 5 * dpr), Math.sin(a) * (r + 5 * dpr))
+        ctx.lineTo(Math.cos(a) * (r + 7 * dpr), Math.sin(a) * (r + 7 * dpr))
       }
+      ctx.fill()
       ctx.stroke()
-    }
-    if (b.edgeDist < 40 && b.edgeDist > -20 && !prefs.reducedMotion) {
-      ctx.save()
-      ctx.globalAlpha = 0.5 + Math.sin(T * 20) * 0.5
-      ctx.fillStyle = '#ff4d3a'
-      ctx.font = `800 ${12 * dpr}px "Barlow Condensed", sans-serif`
-      ctx.textAlign = 'center'
-      ctx.fillText('!', 0, r + 18 * dpr)
       ctx.restore()
     }
-  }
-
-  private pattern(kind: number, x: number, y: number, r: number): void {
-    const ctx = this.ctx
-    ctx.strokeStyle = 'rgba(0,0,0,0.32)'
-    ctx.fillStyle = 'rgba(0,0,0,0.26)'
-    ctx.lineWidth = Math.max(1.5, r * 0.12)
-    const k = kind % 8
-    if (k === 1) {
-      for (let i = -2; i <= 2; i++) {
+    if (b.magnetTime > 0) {
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.strokeStyle = hexA('#b388ff', 0.7)
+      ctx.lineWidth = 2 * dpr
+      for (let i = 0; i < 3; i++) {
+        const u = (T * 2 + i / 3) % 1
+        ctx.globalAlpha = u
         ctx.beginPath()
-        ctx.moveTo(x - r, y + i * r * 0.32)
-        ctx.lineTo(x + r, y + i * r * 0.32)
+        ctx.arc(0, 0, r + (1 - u) * 40 * dpr, 0, TAU)
         ctx.stroke()
       }
-    } else if (k === 2) {
-      for (const [ox, oy] of [[-0.3, -0.2], [0.25, 0.15], [0, 0.45], [-0.25, 0.3], [0.3, -0.35]]) {
-        ctx.beginPath()
-        ctx.arc(x + ox! * r, y + oy! * r, r * 0.13, 0, TAU)
-        ctx.fill()
-      }
-    } else if (k === 3) {
+      ctx.restore()
+    }
+    if (b.dashCd <= 0 && !b.bot) {
+      const a = T * 3
+      ctx.fillStyle = '#ffffff'
       ctx.beginPath()
-      ctx.moveTo(x - r * 0.5, y)
-      ctx.lineTo(x + r * 0.5, y)
-      ctx.moveTo(x, y - r * 0.5)
-      ctx.lineTo(x, y + r * 0.5)
-      ctx.stroke()
-    } else if (k === 4) {
-      ctx.beginPath()
-      ctx.moveTo(x - r * 0.35, y + r * 0.15)
-      ctx.lineTo(x, y - r * 0.35)
-      ctx.lineTo(x + r * 0.35, y + r * 0.15)
-      ctx.stroke()
-    } else if (k === 5) {
-      ctx.beginPath()
-      ctx.arc(x, y, r * 0.45, 0, TAU)
-      ctx.stroke()
-    } else if (k === 6) {
-      ctx.beginPath()
-      ctx.moveTo(x, y - r * 0.45)
-      ctx.lineTo(x + r * 0.4, y)
-      ctx.lineTo(x, y + r * 0.45)
-      ctx.lineTo(x - r * 0.4, y)
-      ctx.closePath()
-      ctx.stroke()
-    } else if (k === 7) {
-      ctx.beginPath()
-      ctx.arc(x, y, r * 0.55, 0, Math.PI)
-      ctx.stroke()
-    } else {
-      ctx.beginPath()
-      ctx.arc(x, y, r * 1.05, -0.4, 0.4)
-      ctx.lineTo(x, y)
-      ctx.closePath()
+      ctx.arc(Math.cos(a) * (r + 5 * dpr), Math.sin(a) * (r + 5 * dpr), 2.4 * dpr, 0, TAU)
       ctx.fill()
     }
   }
 
   /** Floor ring in the team colour, so partners read at a glance. */
-  private teamRing(x: number, y: number, r: number, color: string): void {
+  private teamRing(b: Body, project: Project, color: string): void {
     const ctx = this.ctx
+    const s = project(b.x, b.y)
+    const r = b.radius * this.Z * 1.3
     ctx.beginPath()
-    ctx.ellipse(x, y + r * 0.15, r * 1.25, r * 0.6, 0, 0, TAU)
-    ctx.strokeStyle = hexA(color, 0.85)
-    ctx.lineWidth = 2.5 * this.dpr
+    ctx.ellipse(s.x, s.y, r, r * TILT, 0, 0, TAU)
+    ctx.strokeStyle = hexA(color, 0.9)
+    ctx.lineWidth = 3 * this.dpr
     ctx.stroke()
   }
-
-  private labelScale = 1
 
   private heatText(b: Body): string {
     return b.heat >= 1 ? `${Math.floor(b.heat)}%` : ''
@@ -1562,117 +2469,109 @@ export class Renderer {
   private labelWidth(b: Body): number {
     const ctx = this.ctx
     const dpr = this.dpr * this.labelScale
-    ctx.font = `700 ${12 * dpr}px Barlow, "Segoe UI", sans-serif`
-    let w = ctx.measureText(b.name).width + 14 * dpr
+    ctx.font = `600 ${12 * dpr}px ${UI_FONT}`
+    let w = ctx.measureText(b.name).width + 16 * dpr
     const heat = this.heatText(b)
     if (heat) {
-      ctx.font = `800 ${14 * dpr}px "Barlow Condensed", Impact, sans-serif`
+      ctx.font = `${17 * dpr}px ${DISPLAY_FONT}`
       w += ctx.measureText(heat).width * 2 + 10 * dpr
     }
     return w
   }
 
-  private label(b: Body, x: number, y: number, zoom: number, local: boolean, team = ''): void {
+  private label(b: Body, x: number, y: number, local: boolean, team = ''): void {
     const ctx = this.ctx
     const dpr = this.dpr * this.labelScale
-    const above = b.radius * zoom + 24 * dpr
-    const ty = y - above
+    const ty = y
     ctx.save()
-    ctx.font = `700 ${12 * dpr}px Barlow, "Segoe UI", sans-serif`
+    ctx.font = `600 ${12 * dpr}px ${UI_FONT}`
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
     const name = b.name
     const tw = ctx.measureText(name).width
-    const pw = tw + 14 * dpr
-    const ph = 17 * dpr
+    const pw = tw + 16 * dpr
+    const ph = 19 * dpr
     ctx.globalAlpha = b.falling ? 0.5 : 1
     roundRect(ctx, x - pw / 2, ty - ph / 2, pw, ph, ph / 2)
-    ctx.fillStyle = local ? b.color : 'rgba(6,10,16,0.72)'
+    ctx.fillStyle = local ? b.color : 'rgba(8,10,24,0.78)'
     ctx.fill()
-    if (!local || team) {
-      ctx.strokeStyle = team || hexA(b.color, 0.7)
-      ctx.lineWidth = (team ? 2 : 1.2) * dpr
-      ctx.stroke()
-    }
-    ctx.fillStyle = local ? '#0b0f14' : '#f4f7fb'
+    ctx.strokeStyle = team || (local ? 'rgba(255,255,255,0.9)' : hexA(b.color, 0.8))
+    ctx.lineWidth = (team ? 2 : 1.4) * dpr
+    ctx.stroke()
+    ctx.fillStyle = local ? (isLight(b.color) ? '#0b0f14' : '#ffffff') : '#f4f7fb'
     ctx.fillText(name, x, ty + 0.5 * dpr)
     const heat = this.heatText(b)
     if (heat) {
       // Damage percent beside the name, coloured by how launchable the ball is.
-      ctx.save()
-      ctx.font = `800 ${14 * dpr}px "Barlow Condensed", Impact, sans-serif`
+      ctx.font = `${17 * dpr}px ${DISPLAY_FONT}`
       ctx.textAlign = 'left'
       ctx.lineJoin = 'round'
-      ctx.lineWidth = 3.5 * dpr
-      ctx.strokeStyle = 'rgba(6,10,16,0.9)'
-      ctx.strokeText(heat, x + pw / 2 + 4 * dpr, ty + 0.5 * dpr)
+      ctx.lineWidth = 4 * dpr
+      ctx.strokeStyle = 'rgba(8,10,24,0.95)'
+      const hx = x + pw / 2 + 4 * dpr
+      ctx.strokeText(heat, hx, ty + 1 * dpr)
       ctx.fillStyle = heatColor(b.heat)
-      ctx.fillText(heat, x + pw / 2 + 4 * dpr, ty + 0.5 * dpr)
-      ctx.restore()
-    }
-    const stocks = Math.max(0, Math.min(5, b.stocks))
-    for (let i = 0; i < stocks; i++) {
-      ctx.beginPath()
-      ctx.arc(x + (i - (stocks - 1) / 2) * 8 * dpr, ty + ph / 2 + 6 * dpr, 2.6 * dpr, 0, TAU)
-      ctx.fillStyle = b.color
-      ctx.fill()
-      ctx.strokeStyle = 'rgba(0,0,0,0.6)'
-      ctx.lineWidth = 1 * dpr
-      ctx.stroke()
+      ctx.fillText(heat, hx, ty + 1 * dpr)
     }
     if (local) {
       const bob = Math.sin(this.clock * 5) * 2.5 * dpr
-      const ay = ty - ph / 2 - 7 * dpr + bob
+      const ay = ty - ph / 2 - 6 * dpr + bob
       ctx.beginPath()
-      ctx.moveTo(x - 6 * dpr, ay - 6 * dpr)
-      ctx.lineTo(x + 6 * dpr, ay - 6 * dpr)
+      ctx.moveTo(x - 7 * dpr, ay - 8 * dpr)
+      ctx.lineTo(x + 7 * dpr, ay - 8 * dpr)
       ctx.lineTo(x, ay)
       ctx.closePath()
       ctx.fillStyle = '#ffc14d'
       ctx.fill()
+      ctx.strokeStyle = 'rgba(8,10,24,0.9)'
+      ctx.lineWidth = 1.5 * dpr
+      ctx.stroke()
     }
     if (b.emoteTime > 0 && b.emoteText) {
-      ctx.font = `700 ${13 * dpr}px Barlow, sans-serif`
-      const ew = ctx.measureText(b.emoteText).width + 16 * dpr
-      const ey = ty - ph - 16 * dpr
-      const pop = Math.min(1, b.emoteTime * 6)
-      ctx.globalAlpha = pop
-      roundRect(ctx, x - ew / 2, ey - 11 * dpr, ew, 22 * dpr, 6 * dpr)
-      ctx.fillStyle = '#ffc14d'
+      ctx.font = `700 ${13 * dpr}px ${UI_FONT}`
+      ctx.textAlign = 'center'
+      const ew = ctx.measureText(b.emoteText).width + 18 * dpr
+      const ey = ty - ph - 18 * dpr
+      const pop = easeOutBack(Math.min(1, (1.6 - b.emoteTime) * 5))
+      ctx.globalAlpha = Math.min(1, b.emoteTime * 4)
+      ctx.translate(x, ey)
+      ctx.scale(pop, pop)
+      roundRect(ctx, -ew / 2, -12 * dpr, ew, 24 * dpr, 8 * dpr)
+      ctx.fillStyle = '#ffffff'
       ctx.fill()
       ctx.beginPath()
-      ctx.moveTo(x - 5 * dpr, ey + 11 * dpr)
-      ctx.lineTo(x + 5 * dpr, ey + 11 * dpr)
-      ctx.lineTo(x, ey + 17 * dpr)
+      ctx.moveTo(-5 * dpr, 12 * dpr)
+      ctx.lineTo(5 * dpr, 12 * dpr)
+      ctx.lineTo(0, 18 * dpr)
       ctx.fill()
-      ctx.fillStyle = '#1a1205'
-      ctx.fillText(b.emoteText, x, ey + 0.5 * dpr)
+      ctx.fillStyle = '#16122a'
+      ctx.fillText(b.emoteText, 0, 0.5 * dpr)
     }
     ctx.restore()
   }
 
-  // ---------------------------------------------------------------- screen
+  // ================================================================ screen
 
   private screenFx(match: Match, w: number, h: number, dt: number, prefs: RenderPrefs, focus: Body | undefined, localId: string): void {
     const ctx = this.ctx
     const you = match.players.find((p) => p.id === localId)
     // Speed lines when the local ball is near its cap.
-    const want = you && you.alive && !prefs.reducedMotion ? clamp((you.momentum - 0.72) / 0.28, 0, 1) : 0
+    const want = you && you.alive && !prefs.reducedMotion ? clamp((you.momentum - 0.7) / 0.3, 0, 1) : 0
     this.speedLines = lerp(this.speedLines, want, 1 - Math.exp(-6 * dt))
     if (this.speedLines > 0.02 && you) {
       ctx.save()
       ctx.globalCompositeOperation = 'lighter'
-      const a = Math.atan2(you.vy, you.vx)
+      const a = Math.atan2(you.vy * TILT, you.vx)
       const cx = w / 2
       const cy = h / 2
       const R = Math.hypot(w, h) / 2
-      for (let i = 0; i < 26; i++) {
+      for (let i = 0; i < 30; i++) {
         const seed = Math.floor(this.clock * 20) + i * 7
         const ang = a + Math.PI + (hashN(seed) - 0.5) * 2.6
         const r0 = R * (0.55 + hashN(seed + 3) * 0.3)
-        const len = R * (0.12 + hashN(seed + 5) * 0.2)
-        ctx.strokeStyle = `rgba(255,255,255,${0.12 * this.speedLines})`
-        ctx.lineWidth = (1 + hashN(seed + 9) * 2) * this.dpr
+        const len = R * (0.12 + hashN(seed + 5) * 0.22)
+        ctx.strokeStyle = `rgba(255,255,255,${0.13 * this.speedLines})`
+        ctx.lineWidth = (1 + hashN(seed + 9) * 2.5) * this.dpr
         ctx.beginPath()
         ctx.moveTo(cx + Math.cos(ang) * r0, cy + Math.sin(ang) * r0)
         ctx.lineTo(cx + Math.cos(ang) * (r0 + len), cy + Math.sin(ang) * (r0 + len))
@@ -1685,14 +2584,19 @@ export class Renderer {
       const u = clamp(this.finish.life / this.finish.max, 0, 1)
       const env = Math.sin(u * Math.PI)
       ctx.save()
+      // Letterbox bars for the finishing blow.
+      const bar = h * 0.09 * env
+      ctx.fillStyle = 'rgba(0,0,0,0.92)'
+      ctx.fillRect(0, 0, w, bar)
+      ctx.fillRect(0, h - bar, w, bar)
       const g = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.15, w / 2, h / 2, Math.max(w, h) * 0.7)
       g.addColorStop(0, 'rgba(255,40,30,0)')
-      g.addColorStop(1, `rgba(255,40,30,${0.4 * env})`)
+      g.addColorStop(1, `rgba(255,40,30,${0.35 * env})`)
       ctx.fillStyle = g
       ctx.fillRect(0, 0, w, h)
       ctx.globalCompositeOperation = 'lighter'
-      for (let i = 0; i < 40; i++) {
-        const ang = (i / 40) * TAU + hashN(i) * 0.2
+      for (let i = 0; i < 48; i++) {
+        const ang = (i / 48) * TAU + hashN(i) * 0.2
         const r0 = Math.min(w, h) * (0.25 + hashN(i + 11) * 0.2)
         ctx.strokeStyle = `rgba(255,255,255,${0.14 * env})`
         ctx.lineWidth = (1 + hashN(i + 4) * 3) * this.dpr
@@ -1705,7 +2609,7 @@ export class Renderer {
     }
 
     if (match.status === 'sudden') {
-      const pulse = 0.18 + Math.sin(this.clock * 6) * 0.08
+      const pulse = 0.2 + Math.sin(this.clock * 6) * 0.08
       this.vignette(w, h, pulse, '255,60,30')
     } else if (focus && focus.alive && focus.id === localId && focus.edgeDist < 90 && focus.edgeDist > -30) {
       const outward = focus.vx * -focus.safetyX + focus.vy * -focus.safetyY
@@ -1733,10 +2637,10 @@ export class Renderer {
   private offscreen(match: Match, project: Project, w: number, h: number, localId: string): void {
     const ctx = this.ctx
     const dpr = this.dpr
-    const pad = 26 * dpr
+    const pad = 30 * dpr
     for (const b of match.players) {
       if (!b.alive) continue
-      const p = project(b.x, b.y)
+      const p = project(b.x, b.y, b.radius)
       if (p.x > 0 && p.x < w && p.y > 0 && p.y < h) continue
       const cx = clamp(p.x, pad, w - pad)
       const cy = clamp(p.y, pad, h - pad)
@@ -1744,21 +2648,18 @@ export class Renderer {
       ctx.save()
       ctx.translate(cx, cy)
       ctx.beginPath()
-      ctx.arc(0, 0, 13 * dpr, 0, TAU)
-      ctx.fillStyle = 'rgba(6,10,16,0.8)'
+      ctx.arc(0, 0, 15 * dpr, 0, TAU)
+      ctx.fillStyle = 'rgba(8,10,24,0.85)'
       ctx.fill()
       ctx.strokeStyle = b.id === localId ? '#ffc14d' : b.color
-      ctx.lineWidth = 2 * dpr
+      ctx.lineWidth = 2.5 * dpr
       ctx.stroke()
-      ctx.beginPath()
-      ctx.arc(0, 0, 7 * dpr, 0, TAU)
-      ctx.fillStyle = b.color
-      ctx.fill()
+      paintBall(ctx, 0, 0, 9 * dpr, { color: b.color, skin: b.skin, pattern: b.pattern, lookX: Math.cos(a) * 0.6, lookY: Math.sin(a) * 0.6, expression: 'scared', blink: 0, time: this.clock, dpr })
       ctx.rotate(a)
       ctx.beginPath()
-      ctx.moveTo(18 * dpr, 0)
-      ctx.lineTo(12 * dpr, -5 * dpr)
-      ctx.lineTo(12 * dpr, 5 * dpr)
+      ctx.moveTo(22 * dpr, 0)
+      ctx.lineTo(15 * dpr, -6 * dpr)
+      ctx.lineTo(15 * dpr, 6 * dpr)
       ctx.closePath()
       ctx.fillStyle = b.id === localId ? '#ffc14d' : b.color
       ctx.fill()
@@ -1770,47 +2671,61 @@ export class Renderer {
     if (match.silent) return
     const ctx = this.ctx
     const dpr = this.dpr
+    const s = Math.min(1.2, Math.min(w, h) / dpr / 720)
     ctx.save()
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
-    if (match.countdownTicks > 0) {
+    if (match.countdownTicks > 0 && match.countdownTicks <= 180) {
       const n = Math.ceil(match.countdownTicks / 60)
       const u = 1 - ((match.countdownTicks - 1) % 60) / 60
       const pop = easeOutBack(clamp(u / 0.3, 0, 1))
-      const scale = lerp(1.9, 1, pop) * (u > 0.8 ? lerp(1, 0.85, (u - 0.8) / 0.2) : 1)
+      const scale = lerp(2.2, 1, pop) * (u > 0.8 ? lerp(1, 0.8, (u - 0.8) / 0.2) : 1) * s
       const alpha = u > 0.8 ? 1 - (u - 0.8) / 0.2 : 1
       ctx.globalAlpha = alpha
-      ctx.beginPath()
-      ctx.arc(w / 2, h / 2, (70 + u * 50) * dpr, 0, TAU)
-      ctx.strokeStyle = `rgba(255,255,255,${0.3 * (1 - u)})`
-      ctx.lineWidth = 4 * dpr
-      ctx.stroke()
       ctx.translate(w / 2, h / 2)
+      // Slash behind the digit.
+      ctx.save()
+      ctx.rotate(-0.12)
+      const sw = (300 + u * 200) * dpr * s
+      const g = ctx.createLinearGradient(-sw, 0, sw, 0)
+      const col = n === 1 ? '255,193,77' : '255,255,255'
+      g.addColorStop(0, `rgba(${col},0)`)
+      g.addColorStop(0.5, `rgba(${col},${0.25 * (1 - u * 0.6)})`)
+      g.addColorStop(1, `rgba(${col},0)`)
+      ctx.fillStyle = g
+      ctx.fillRect(-sw, -36 * dpr * s, sw * 2, 72 * dpr * s)
+      ctx.restore()
       ctx.scale(scale, scale)
-      ctx.font = `800 ${120 * dpr}px "Barlow Condensed", Impact, sans-serif`
-      ctx.lineWidth = 10 * dpr
-      ctx.strokeStyle = 'rgba(6,10,16,0.85)'
-      ctx.strokeText(String(n), 0, 0)
+      ctx.font = `${150 * dpr}px ${DISPLAY_FONT}`
+      ctx.lineJoin = 'round'
+      ctx.lineWidth = 16 * dpr
+      ctx.strokeStyle = 'rgba(8,10,24,0.92)'
+      ctx.strokeText(String(n), 0, 6 * dpr)
       ctx.fillStyle = n === 1 ? '#ffc14d' : '#f4f7fb'
       ctx.fillText(String(n), 0, 0)
     } else if (match.goFlash > 0) {
       const u = 1 - match.goFlash / 0.75
       const pop = easeOutBack(clamp(u / 0.25, 0, 1))
-      const scale = lerp(2.4, 1, pop) + u * 0.25
+      const scale = (lerp(2.6, 1, pop) + u * 0.3) * s
       ctx.globalAlpha = clamp(match.goFlash * 2.2, 0, 1)
       ctx.beginPath()
-      ctx.arc(w / 2, h / 2, (60 + u * 420) * dpr, 0, TAU)
-      ctx.strokeStyle = `rgba(255,77,58,${0.6 * (1 - u)})`
-      ctx.lineWidth = (14 * (1 - u) + 2) * dpr
+      ctx.ellipse(w / 2, h / 2, (60 + u * 700) * dpr, (60 + u * 700) * dpr * TILT, 0, 0, TAU)
+      ctx.strokeStyle = `rgba(255,77,58,${0.7 * (1 - u)})`
+      ctx.lineWidth = (18 * (1 - u) + 2) * dpr
       ctx.stroke()
       ctx.translate(w / 2, h / 2)
-      ctx.rotate(-0.06)
+      ctx.rotate(-0.08)
       ctx.scale(scale, scale)
-      ctx.font = `800 ${120 * dpr}px "Barlow Condensed", Impact, sans-serif`
-      ctx.lineWidth = 10 * dpr
-      ctx.strokeStyle = 'rgba(6,10,16,0.85)'
-      ctx.strokeText('GO!', 0, 0)
-      ctx.fillStyle = '#ff4d3a'
+      ctx.font = `${150 * dpr}px ${DISPLAY_FONT}`
+      ctx.lineJoin = 'round'
+      ctx.lineWidth = 16 * dpr
+      ctx.strokeStyle = 'rgba(8,10,24,0.92)'
+      ctx.strokeText('GO!', 0, 6 * dpr)
+      const g = ctx.createLinearGradient(0, -60 * dpr, 0, 60 * dpr)
+      g.addColorStop(0, '#ffb199')
+      g.addColorStop(0.5, '#ff4d3a')
+      g.addColorStop(1, '#d1203a')
+      ctx.fillStyle = g
       ctx.fillText('GO!', 0, 0)
     }
     ctx.restore()
@@ -1825,24 +2740,26 @@ export class Renderer {
     ctx.fillRect(0, 0, w, h)
   }
 
-  // ---------------------------------------------------------------- particles
+  // ================================================================ particles
 
-  private add(
-    kind: ParticleKind, x: number, y: number, vx: number, vy: number, size: number, color: string,
-    life: number, drag: number, rot = 0, text = '', spin = 0,
-  ): void {
+  private add(p: Partial<Particle> & Pick<Particle, 'kind' | 'x' | 'y' | 'life'>): void {
     if (this.particles.length >= MAX_PARTICLES) this.particles.shift()
-    this.particles.push({ kind, x, y, vx, vy, size, color, life, max: life, drag, rot, text, spin, seed: Math.random() })
+    this.particles.push({
+      z: 0, vx: 0, vy: 0, vz: 0, g: 0, size: 4, color: '#ffffff', text: '', rot: 0, spin: 0, drag: 0,
+      ...p,
+      max: p.life,
+      seed: Math.random(),
+    })
   }
 
   private ring(x: number, y: number, color: string, size: number, life: number, width: number): void {
-    this.add('ring', x, y, 0, 0, size, color, life, 0, 0, '', width)
+    this.add({ kind: 'ring', x, y, z: 0, size, color, life, spin: width })
   }
 
   private popNumber(x: number, y: number, text: string, power: number, owner: string): void {
     // Smash damage colours: white, yellow, red, maroon.
-    const color = power < 420 ? '#f4f7fb' : power < 620 ? '#ffc14d' : power < 820 ? '#ff4d3a' : '#c2182b'
-    const size = 14 + Math.min(14, power / 60)
+    const color = power < 420 ? '#f4f7fb' : power < 620 ? '#ffc14d' : power < 820 ? '#ff4d3a' : '#ff2d55'
+    const size = 16 + Math.min(18, power / 50)
     // A flurry on one ball shows one number that grows, not a pile of overlapping digits.
     const live = owner ? this.particles.find((p) => p.kind === 'text' && p.owner === owner && p.max - p.life < 0.45) : undefined
     if (live) {
@@ -1856,56 +2773,74 @@ export class Renderer {
       live.y = y
       return
     }
-    this.add('text', x, y, (Math.random() - 0.5) * 30, -70, size, color, 0.85, 3, (Math.random() - 0.5) * 0.2, text)
-    const made = this.particles[this.particles.length - 1]
-    if (made) made.owner = owner
+    this.add({ kind: 'text', x, y, z: 60, vx: (Math.random() - 0.5) * 40, vz: 90, size, color, life: 0.9, drag: 3, rot: (Math.random() - 0.5) * 0.25, text, owner })
   }
 
   private bolts(x: number, y: number, ang: number, k: number): void {
     for (let i = 0; i < 4; i++) {
       const a = ang + (i - 1.5) * 0.5 + (Math.random() - 0.5) * 0.3
-      this.add('bolt', x, y, 0, 0, 40 + k * 50, i % 2 ? '#ff2d2d' : '#16060a', 0.16, 0, a)
+      this.add({ kind: 'bolt', x, y, z: 20, size: 50 + k * 60, color: i % 2 ? '#ff2d2d' : '#16060a', life: 0.16, rot: a })
     }
   }
 
   private impactStyle(style: string, x: number, y: number, color: string, k: number, full: boolean): void {
-    if (style === 'impact_burst' && k > 0.4) {
-      this.add('flash', x, y, 0, 0, 30 + k * 60, color, 0.14, 0)
+    if (style === 'impact_burst' && k > 0.35) {
+      this.add({ kind: 'flash', x, y, z: 20, size: 40 + k * 70, color, life: 0.16 })
+      this.add({ kind: 'sring', x, y, z: 20, size: 40 + k * 40, color, life: 0.3, spin: 5 })
     } else if (style === 'impact_shatter' && full) {
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 10; i++) {
         const a = Math.random() * TAU
-        const s = 140 + Math.random() * 260
-        this.add('shard', x, y, Math.cos(a) * s, Math.sin(a) * s, 4 + Math.random() * 4, color, 0.5, 3, a, '', (Math.random() - 0.5) * 20)
+        const s = 160 + Math.random() * 280
+        this.add({ kind: 'shard', x, y, z: 20, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: 150 + Math.random() * 200, g: 900, size: 5 + Math.random() * 4, color, life: 0.6, drag: 2, rot: a, spin: (Math.random() - 0.5) * 20 })
       }
     } else if (style === 'impact_glyph') {
-      this.add('ring', x, y, 0, 0, 30 + k * 30, '#ffc14d', 0.45, 0, 0, 'glyph', 3)
+      this.add({ kind: 'ring', x, y, z: 0, size: 40 + k * 40, color: '#ffc14d', life: 0.5, text: 'glyph', spin: 3 })
     }
   }
 
-  private drawParticles(project: Project, zoom: number, dt: number, prefs: RenderPrefs): void {
+  private drawParticles(project: Project, dt: number, prefs: RenderPrefs, layer: 'behind' | 'ground' | 'air'): void {
     const ctx = this.ctx
     const dpr = this.dpr
+    const Z = this.Z
+    // Only the first pass of the frame advances the simulation.
+    if (layer === 'behind' && dt > 0) {
+      for (const p of this.particles) {
+        p.life -= dt
+        if (p.life <= 0) continue
+        const damp = Math.exp(-p.drag * dt)
+        p.vx *= damp
+        p.vy *= damp
+        p.vz -= p.g * dt
+        if (p.kind === 'confetti') p.vz *= Math.exp(-1.5 * dt)
+        p.x += p.vx * dt
+        p.y += p.vy * dt
+        p.z += p.vz * dt
+        if ((p.kind === 'spark' || p.kind === 'chunk' || p.kind === 'shard' || p.kind === 'confetti') && p.z < 0 && p.vz < 0) {
+          p.z = 0
+          p.vz *= -0.35
+          p.vx *= 0.6
+          p.vy *= 0.6
+        }
+        p.rot += p.spin * dt
+      }
+      this.particles = this.particles.filter((p) => p.life > 0)
+    }
     ctx.save()
     for (const p of this.particles) {
-      p.life -= dt
-      if (p.life <= 0) continue
-      const damp = Math.exp(-p.drag * dt)
-      p.vx *= damp
-      p.vy *= damp
-      if (p.kind === 'confetti') p.vy += 260 * dt
-      if (p.kind === 'ember') p.vy -= 30 * dt
-      p.x += p.vx * dt
-      p.y += p.vy * dt
-      p.rot += p.spin * dt
-      const s = project(p.x, p.y)
+      const ground = p.kind === 'ring' || p.kind === 'implode' || p.kind === 'scorch' || p.kind === 'puff'
+      const want = p.kind === 'faller' ? (p.behind ? 'behind' : 'air') : ground ? 'ground' : 'air'
+      if (want !== layer) continue
       const t = clamp(p.life / p.max, 0, 1)
       const u = 1 - t
       ctx.globalAlpha = t
       ctx.globalCompositeOperation = 'source-over'
-      if (p.kind === 'ring') {
-        const rr = p.size * zoom * easeOutCubic(u) + 2
+      if (p.kind === 'ring' || p.kind === 'implode') {
+        const grow = p.kind === 'implode' ? 1 - easeOutCubic(u) : easeOutCubic(u)
+        const s = project(p.x, p.y)
+        const rr = p.size * Z * grow + 2
+        ctx.globalCompositeOperation = 'lighter'
         ctx.beginPath()
-        ctx.arc(s.x, s.y, rr, 0, TAU)
+        ctx.ellipse(s.x, s.y, rr, rr * TILT, 0, 0, TAU)
         ctx.strokeStyle = p.color
         ctx.lineWidth = Math.max(0.5, p.spin * t) * dpr
         ctx.stroke()
@@ -1913,17 +2848,51 @@ export class Renderer {
           for (let i = 0; i < 8; i++) {
             const a = (i / 8) * TAU + u
             ctx.beginPath()
-            ctx.moveTo(s.x + Math.cos(a) * rr, s.y + Math.sin(a) * rr)
-            ctx.lineTo(s.x + Math.cos(a) * (rr + 6 * dpr), s.y + Math.sin(a) * (rr + 6 * dpr))
+            ctx.moveTo(s.x + Math.cos(a) * rr, s.y + Math.sin(a) * rr * TILT)
+            ctx.lineTo(s.x + Math.cos(a) * (rr + 8 * dpr), s.y + Math.sin(a) * (rr + 8 * dpr) * TILT)
             ctx.stroke()
           }
         }
+      } else if (p.kind === 'scorch') {
+        const s = project(p.x, p.y)
+        const rr = p.size * Z
+        ctx.globalAlpha = Math.min(1, t * 3) * 0.5
+        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rr)
+        g.addColorStop(0, 'rgba(10,6,8,0.9)')
+        g.addColorStop(0.6, 'rgba(20,10,10,0.5)')
+        g.addColorStop(1, 'rgba(20,10,10,0)')
+        ctx.fillStyle = g
+        ctx.beginPath()
+        ctx.ellipse(s.x, s.y, rr, rr * TILT, 0, 0, TAU)
+        ctx.fill()
+      } else if (p.kind === 'puff') {
+        const s = project(p.x, p.y, p.z)
+        const rr = p.size * Z * (0.6 + u * 1.5)
+        ctx.globalAlpha = t * 0.45
+        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rr)
+        g.addColorStop(0, p.color)
+        g.addColorStop(0.5, hexA(p.color, 0.6))
+        g.addColorStop(1, hexA(p.color, 0))
+        ctx.fillStyle = g
+        ctx.beginPath()
+        ctx.ellipse(s.x, s.y, rr, rr * 0.75, 0, 0, TAU)
+        ctx.fill()
+      } else if (p.kind === 'smoke') {
+        const s = project(p.x, p.y, p.z)
+        const rr = p.size * Z * (0.6 + u * 1.6)
+        ctx.globalAlpha = t * 0.4
+        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rr)
+        g.addColorStop(0, p.color)
+        g.addColorStop(1, hexA(p.color.startsWith('#') ? p.color : '#888888', 0))
+        ctx.fillStyle = g
+        ctx.fillRect(s.x - rr, s.y - rr, rr * 2, rr * 2)
       } else if (p.kind === 'spark' || p.kind === 'ember') {
         ctx.globalCompositeOperation = 'lighter'
-        const sp = Math.hypot(p.vx, p.vy)
-        const len = Math.min(26, sp * 0.03 + 2) * dpr * (zoom / 0.6)
+        const s = project(p.x, p.y, p.z)
+        const sp = Math.hypot(p.vx, p.vy * TILT - p.vz)
+        const len = Math.min(30, sp * 0.032 + 2) * dpr * (Z / 0.6)
         const nx = sp > 0 ? p.vx / sp : 1
-        const ny = sp > 0 ? p.vy / sp : 0
+        const ny = sp > 0 ? (p.vy * TILT - p.vz) / sp : 0
         ctx.strokeStyle = p.color
         ctx.lineWidth = p.size * dpr * t + 0.5
         ctx.lineCap = 'round'
@@ -1931,27 +2900,43 @@ export class Renderer {
         ctx.moveTo(s.x, s.y)
         ctx.lineTo(s.x - nx * len, s.y - ny * len)
         ctx.stroke()
-      } else if (p.kind === 'dust') {
-        ctx.globalAlpha = t * 0.45
-        ctx.beginPath()
-        ctx.arc(s.x, s.y, p.size * dpr * (0.6 + u * 1.2), 0, TAU)
-        ctx.fillStyle = p.color
-        ctx.fill()
       } else if (p.kind === 'flash') {
         ctx.globalCompositeOperation = 'lighter'
-        const rr = p.size * dpr * (0.6 + u * 0.6)
+        const s = project(p.x, p.y, p.z)
+        const rr = p.size * Z * (0.6 + u * 0.7)
         const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rr)
         g.addColorStop(0, hexA(p.color, 0.95))
         g.addColorStop(1, hexA(p.color, 0))
         ctx.fillStyle = g
         ctx.fillRect(s.x - rr, s.y - rr, rr * 2, rr * 2)
-      } else if (p.kind === 'confetti' || p.kind === 'shard') {
+      } else if (p.kind === 'sring') {
+        ctx.globalCompositeOperation = 'lighter'
+        const s = project(p.x, p.y, p.z)
+        const rr = p.size * Z * (0.3 + easeOutCubic(u) * 1.1)
+        ctx.beginPath()
+        ctx.arc(s.x, s.y, rr, 0, TAU)
+        ctx.strokeStyle = p.color
+        ctx.lineWidth = Math.max(0.5, p.spin * t) * dpr
+        ctx.stroke()
+      } else if (p.kind === 'confetti' || p.kind === 'shard' || p.kind === 'chunk') {
+        const s = project(p.x, p.y, p.z)
         ctx.translate(s.x, s.y)
-        ctx.rotate(p.rot + p.seed * 6 + this.clock * (p.kind === 'confetti' ? 6 : 0))
+        ctx.rotate(p.rot + p.seed * 6)
         ctx.fillStyle = p.color
-        const sz = p.size * dpr
+        const sz = p.size * dpr * (Z / 0.7)
         if (p.kind === 'confetti') ctx.fillRect(-sz, -sz * 0.5 * Math.abs(Math.sin(this.clock * 8 + p.seed * 9)), sz * 2, sz)
-        else {
+        else if (p.kind === 'chunk') {
+          ctx.beginPath()
+          ctx.moveTo(-sz, -sz * 0.6)
+          ctx.lineTo(sz * 0.8, -sz)
+          ctx.lineTo(sz, sz * 0.5)
+          ctx.lineTo(-sz * 0.4, sz)
+          ctx.closePath()
+          ctx.fill()
+          ctx.strokeStyle = 'rgba(0,0,0,0.4)'
+          ctx.lineWidth = dpr
+          ctx.stroke()
+        } else {
           ctx.beginPath()
           ctx.moveTo(-sz, -sz * 0.4)
           ctx.lineTo(sz, 0)
@@ -1961,8 +2946,9 @@ export class Renderer {
         ctx.setTransform(1, 0, 0, 1, 0, 0)
       } else if (p.kind === 'star') {
         ctx.globalCompositeOperation = 'lighter'
+        const s = project(p.x, p.y, p.z)
         ctx.translate(s.x, s.y)
-        ctx.rotate(this.clock * 4)
+        ctx.rotate(this.clock * 4 + p.seed * 6)
         ctx.fillStyle = p.color
         const sz = p.size * dpr * t
         ctx.beginPath()
@@ -1974,34 +2960,36 @@ export class Renderer {
         ctx.fill()
         ctx.setTransform(1, 0, 0, 1, 0, 0)
       } else if (p.kind === 'bolt') {
+        const s = project(p.x, p.y, p.z)
         ctx.strokeStyle = p.color
         ctx.lineWidth = (p.color === '#16060a' ? 5 : 3) * dpr
         ctx.lineJoin = 'miter'
         ctx.beginPath()
         ctx.moveTo(s.x, s.y)
-        const len = p.size * zoom
+        const len = p.size * Z
         const segs = 4
         for (let i = 1; i <= segs; i++) {
           const d = (i / segs) * len
           const j = (hashN(Math.floor(p.seed * 1000) + i) - 0.5) * len * 0.35
-          ctx.lineTo(s.x + Math.cos(p.rot) * d - Math.sin(p.rot) * j, s.y + Math.sin(p.rot) * d + Math.cos(p.rot) * j)
+          ctx.lineTo(s.x + Math.cos(p.rot) * d - Math.sin(p.rot) * j, s.y + (Math.sin(p.rot) * d + Math.cos(p.rot) * j) * TILT)
         }
         ctx.stroke()
       } else if (p.kind === 'beam') {
         if (prefs.reducedMotion) continue
         // Smash blast-line column, pointing where the ball flew.
         ctx.globalCompositeOperation = 'lighter'
-        const len = 900 * zoom * easeOutCubic(clamp(u * 4, 0, 1))
-        const wid = 90 * zoom * t
+        const s = project(p.x, p.y, 10)
+        const len = 1100 * Z * easeOutCubic(clamp(u * 4, 0, 1))
+        const wid = 110 * Z * t
         ctx.translate(s.x, s.y)
-        ctx.rotate(p.rot)
+        ctx.rotate(Math.atan2(Math.sin(p.rot) * TILT, Math.cos(p.rot)))
         const g = ctx.createLinearGradient(0, 0, len, 0)
-        g.addColorStop(0, hexA('#ffffff', 0.9 * t))
-        g.addColorStop(0.2, hexA(p.color, 0.7 * t))
+        g.addColorStop(0, hexA('#ffffff', 0.95 * t))
+        g.addColorStop(0.25, hexA(p.color, 0.75 * t))
         g.addColorStop(1, hexA(p.color, 0))
         ctx.fillStyle = g
         ctx.beginPath()
-        ctx.moveTo(-10 * dpr, 0)
+        ctx.moveTo(-12 * dpr, 0)
         ctx.lineTo(len, -wid)
         ctx.lineTo(len, wid)
         ctx.closePath()
@@ -2009,80 +2997,142 @@ export class Renderer {
         ctx.setTransform(1, 0, 0, 1, 0, 0)
       } else if (p.kind === 'pillar') {
         ctx.globalCompositeOperation = 'lighter'
-        const wid = p.size * zoom * (0.4 + t * 0.6)
-        const hgt = 520 * zoom
+        const s = project(p.x, p.y)
+        const wid = p.size * Z * (0.4 + t * 0.6)
+        const hgt = 900 * Z
         const g = ctx.createLinearGradient(0, s.y - hgt, 0, s.y)
         g.addColorStop(0, hexA(p.color, 0))
-        g.addColorStop(1, hexA(p.color, 0.55 * t))
+        g.addColorStop(1, hexA(p.color, 0.6 * t))
         ctx.fillStyle = g
         ctx.fillRect(s.x - wid / 2, s.y - hgt, wid, hgt)
+      } else if (p.kind === 'streak') {
+        ctx.globalCompositeOperation = 'lighter'
+        ctx.lineCap = 'round'
+        if (p.x2 !== undefined && p.y2 !== undefined) {
+          const a = project(p.x, p.y, p.z)
+          const b = project(p.x2, p.y2, p.z)
+          ctx.strokeStyle = hexA(p.color, 0.8 * t)
+          ctx.lineWidth = 16 * Z * t
+          ctx.beginPath()
+          ctx.moveTo(a.x, a.y)
+          ctx.lineTo(b.x, b.y)
+          ctx.stroke()
+          ctx.strokeStyle = hexA('#ffffff', 0.9 * t)
+          ctx.lineWidth = 4 * Z * t
+          ctx.stroke()
+        } else {
+          const a = project(p.x, p.y, p.z)
+          const b = project(p.x + Math.cos(p.rot) * p.size * (0.4 + u), p.y + Math.sin(p.rot) * p.size * (0.4 + u), p.z)
+          const g = ctx.createLinearGradient(a.x, a.y, b.x, b.y)
+          g.addColorStop(0, hexA(p.color, 0.8 * t))
+          g.addColorStop(1, hexA(p.color, 0))
+          ctx.strokeStyle = g
+          ctx.lineWidth = 40 * Z * t
+          ctx.beginPath()
+          ctx.moveTo(a.x, a.y)
+          ctx.lineTo(b.x, b.y)
+          ctx.stroke()
+        }
+      } else if (p.kind === 'faller' && p.look) {
+        const s = project(p.x, p.y, p.z)
+        const k = clamp(1 + p.z / 900, 0.15, 1)
+        ctx.globalAlpha = Math.min(1, t * 2)
+        ctx.translate(s.x, s.y)
+        ctx.rotate(p.rot)
+        paintBall(ctx, 0, 0, p.size * Z * k, { ...p.look, time: this.clock, dpr })
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+      } else if (p.kind === 'zzz') {
+        const s = project(p.x, p.y, p.z)
+        ctx.globalAlpha = Math.sin(t * Math.PI)
+        ctx.font = `${p.size * dpr * (0.6 + u * 0.6)}px ${DISPLAY_FONT}`
+        ctx.textAlign = 'center'
+        ctx.fillStyle = p.color
+        ctx.fillText(p.text, s.x + Math.sin(u * 6) * 6 * dpr, s.y)
       } else if (p.kind === 'text' || p.kind === 'stamp') {
+        const s = project(p.x, p.y, p.z)
         const pop = p.kind === 'stamp' ? easeOutBack(clamp(u / 0.18, 0, 1)) : easeOutBack(clamp(u / 0.15, 0, 1))
-        const sc = p.kind === 'stamp' ? lerp(2.2, 1, pop) : lerp(0.3, 1, pop)
+        const sc = (p.kind === 'stamp' ? lerp(2.4, 1, pop) : lerp(0.3, 1, pop)) * this.labelScale
         ctx.globalAlpha = clamp(t * 2.5, 0, 1)
         ctx.translate(s.x, s.y)
         ctx.rotate(p.rot)
         ctx.scale(sc, sc)
         ctx.textAlign = 'center'
         ctx.textBaseline = 'middle'
-        ctx.font = `800 ${p.size * dpr}px "Barlow Condensed", Impact, sans-serif`
-        ctx.lineWidth = Math.max(3, p.size * 0.22) * dpr
-        ctx.strokeStyle = 'rgba(6,10,16,0.9)'
+        ctx.font = `${p.size * dpr}px ${DISPLAY_FONT}`
+        ctx.lineWidth = Math.max(4, p.size * 0.26) * dpr
+        ctx.strokeStyle = 'rgba(8,10,24,0.95)'
         ctx.lineJoin = 'round'
-        ctx.strokeText(p.text, 0, 0)
+        ctx.strokeText(p.text, 0, p.size * 0.06 * dpr)
         ctx.fillStyle = p.color
         ctx.fillText(p.text, 0, 0)
         ctx.setTransform(1, 0, 0, 1, 0, 0)
       }
     }
     ctx.restore()
-    this.particles = this.particles.filter((p) => p.life > 0)
   }
 
-  // ---------------------------------------------------------------- misc
+  // ================================================================ tiles
 
-  private gridPattern(): CanvasPattern | null {
-    if (this.floorPattern) return this.floorPattern
+  private hexTile(): CanvasPattern | null {
+    if (this.hexPattern) return this.hexPattern
     const tile = document.createElement('canvas')
     const s = 60
     tile.width = s
     tile.height = Math.round(s * Math.sqrt(3))
     const g = tile.getContext('2d')
     if (!g) return null
-    g.strokeStyle = 'rgba(255,255,255,0.09)'
-    g.lineWidth = 1
-    const hex = (cx: number, cy: number, r: number) => {
+    const r = s / 3
+    const hh = tile.height
+    const hex = (cx: number, cy: number) => {
       g.beginPath()
       for (let i = 0; i <= 6; i++) {
         const a = (i / 6) * TAU
         g.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r)
       }
+    }
+    for (const [cx, cy] of [[0, 0], [s, 0], [s / 2, hh / 2], [0, hh], [s, hh]] as const) {
+      hex(cx, cy)
+      g.fillStyle = 'rgba(255,255,255,0.025)'
+      g.fill()
+      g.strokeStyle = 'rgba(255,255,255,0.08)'
+      g.lineWidth = 1.2
       g.stroke()
+      g.strokeStyle = 'rgba(0,0,0,0.18)'
+      g.lineWidth = 1
+      g.save()
+      g.translate(0.8, 1.2)
+      g.stroke()
+      g.restore()
     }
-    const r = s / 3
-    const hh = tile.height
-    for (const [cx, cy] of [[0, 0], [s, 0], [s / 2, hh / 2], [0, hh], [s, hh]] as const) hex(cx, cy, r)
-    this.floorPattern = this.ctx.createPattern(tile, 'repeat')
-    return this.floorPattern
+    this.hexPattern = this.ctx.createPattern(tile, 'repeat')
+    return this.hexPattern
   }
 
-  private css: (x: number, y: number) => { x: number; y: number } = (x, y) => ({ x, y })
-
-  toCss(x: number, y: number): { x: number; y: number } {
-    return this.css(x, y)
+  private lipTile(rim: string): CanvasPattern | null {
+    if (this.lipPattern && this.lipKey === rim) return this.lipPattern
+    this.lipKey = rim
+    const tile = document.createElement('canvas')
+    tile.width = 24
+    tile.height = 24
+    const g = tile.getContext('2d')
+    if (!g) return null
+    g.strokeStyle = hexA(rim, 0.1)
+    g.lineWidth = 5
+    g.beginPath()
+    g.moveTo(-6, 30)
+    g.lineTo(30, -6)
+    g.moveTo(-18, 18)
+    g.lineTo(18, -18)
+    g.moveTo(6, 42)
+    g.lineTo(42, 6)
+    g.stroke()
+    this.lipPattern = this.ctx.createPattern(tile, 'repeat')
+    return this.lipPattern
   }
 
-  private seedStars(): void {
-    for (let i = 0; i < 140; i++) {
-      this.stars.push({
-        x: hashN(i * 3 + 1),
-        y: hashN(i * 3 + 2),
-        r: 0.6 + hashN(i * 3 + 3) * 1.6,
-        a: 0.15 + hashN(i * 7) * 0.5,
-        depth: 0.1 + hashN(i * 11) * 0.5,
-        tw: 0.5 + hashN(i * 13) * 2.5,
-      })
-    }
+  /** CSS pixel position of a world point. `z` lifts it off the floor. */
+  toCss(x: number, y: number, z = 22): { x: number; y: number } {
+    return this.css(x, y, z)
   }
 }
 
@@ -2090,36 +3140,16 @@ function teamColor(team: number): string {
   return TEAM_COLORS[team % TEAM_COLORS.length] ?? '#ffffff'
 }
 
-function hashN(n: number): number {
-  const x = Math.sin(n * 127.1 + 311.7) * 43758.5453
-  return x - Math.floor(x)
+function polyRadius(pose: Pose): number {
+  let m = 0
+  for (const p of pose.points) m = Math.max(m, Math.hypot(p.x - pose.x, p.y - pose.y))
+  return m || 300
 }
 
-function hexA(hex: string, a: number): string {
+function isLight(hex: string): boolean {
   const h = hex.replace('#', '')
-  const n = h.length === 3 ? h.split('').map((c) => c + c).join('') : h.slice(0, 6)
-  const r = parseInt(n.slice(0, 2), 16)
-  const g = parseInt(n.slice(2, 4), 16)
-  const b = parseInt(n.slice(4, 6), 16)
-  return `rgba(${r},${g},${b},${clamp(a, 0, 1)})`
-}
-
-function easeOutBack(t: number): number {
-  const c1 = 1.70158
-  const c3 = c1 + 1
-  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2)
-}
-
-function easeOutCubic(t: number): number {
-  return 1 - Math.pow(1 - t, 3)
-}
-
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-  ctx.beginPath()
-  ctx.moveTo(x + r, y)
-  ctx.arcTo(x + w, y, x + w, y + h, r)
-  ctx.arcTo(x + w, y + h, x, y + h, r)
-  ctx.arcTo(x, y + h, x, y, r)
-  ctx.arcTo(x, y, x + w, y, r)
-  ctx.closePath()
+  const r = parseInt(h.slice(0, 2), 16)
+  const g = parseInt(h.slice(2, 4), 16)
+  const b = parseInt(h.slice(4, 6), 16)
+  return r * 0.299 + g * 0.587 + b * 0.114 > 150
 }

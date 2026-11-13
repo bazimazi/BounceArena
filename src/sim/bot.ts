@@ -77,14 +77,20 @@ function edgeEmergency(body: Body, tick: number): InputFrame | null {
   // A hot ball plays the edge more carefully: one more hit sends it farther.
   const warn = 64 + speed * 0.28 + Math.min(60, body.heat * 0.3)
   const outward = body.vx * -body.safetyX + body.vy * -body.safetyY
-  if (body.edgeDist > warn || outward < 28) return null
+  if (body.edgeDist > warn || outward < 28) {
+    body.botPanic = 0
+    return null
+  }
   const panic = body.edgeDist < 26 + speed * 0.07
+  body.botPanic = panic ? body.botPanic + DT : 0
   const aware = panic || hash01(tick, body.id, 4) < body.skill + 0.25
   if (!aware) return null
+  // Saves are not instant: a rookie needs about a quarter second to react, a champion a sixteenth.
+  const react = lerp(0.24, 0.06, body.skill)
   return {
     x: body.safetyX,
     y: body.safetyY,
-    dash: panic && body.dashCd <= 0 && (body.skill > 0.22 || panic),
+    dash: panic && body.dashCd <= 0 && body.botPanic >= react,
     ability: false,
     brake: !panic && outward > 240,
     emote: false,

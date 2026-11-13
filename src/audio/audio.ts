@@ -117,6 +117,11 @@ export class AudioBus {
         if (!this.voice('dash', 2)) return
         this.whoosh(pan, local ? 0.12 : 0.05, 700, 2600, 0.16)
         this.chirp(320, 900, 0.09, local ? 0.05 : 0.02, 'sine', pan)
+        if (event.text === 'perfect' && local) {
+          // A bright two-note sparkle confirms the timing.
+          this.note(hz(31), 0.12, 'triangle', 0.05, this.sfx!, this.now() + 0.02, pan)
+          this.note(hz(36), 0.2, 'triangle', 0.045, this.sfx!, this.now() + 0.08, pan)
+        }
         return
       case 'ability':
         if (this.abilitySound(event.text, pan, local ? 1 : 0.5)) return

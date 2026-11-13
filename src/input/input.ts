@@ -77,7 +77,7 @@ export class Input {
   }
 
   /** `arrows` lets a solo player steer with the arrow keys too; local duo gives them to player 2. */
-  player(worldX: number, worldY: number, screenOf: (x: number, y: number) => { x: number; y: number }, mouseSteer: boolean, arrows = false): InputFrame {
+  player(worldX: number, worldY: number, screenOf: (x: number, y: number) => { x: number; y: number }, mouseSteer: boolean, arrows = false, tilt = 1): InputFrame {
     let x = 0
     let y = 0
     const codes = arrows ? Object.keys(P1_MOVE) : ['KeyW', 'KeyA', 'KeyS', 'KeyD']
@@ -93,8 +93,9 @@ export class Input {
     }
     if (mouseSteer && this.pointer.inside && x === 0 && y === 0) {
       const s = screenOf(worldX, worldY)
+      // The camera is pitched, so screen height maps back to more floor distance.
       const dx = this.pointer.x - s.x
-      const dy = this.pointer.y - s.y
+      const dy = (this.pointer.y - s.y) / tilt
       const m = Math.hypot(dx, dy)
       if (m > 24) {
         x = dx / m

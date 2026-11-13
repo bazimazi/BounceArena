@@ -29,7 +29,9 @@ Open the local URL. `npm test` runs the physics, match, and progression tests. `
 
 ## What a match is
 
-Free-for-all is the default: three stocks, about 80 seconds, then sudden death if more than one ball remains. Falling off the arena is the knockout. A faster, heavier contact launches a slower ball. Dash is a redirect with a cooldown, and a dash on landing is stronger. Abilities are decisions, not flat power.
+Free-for-all is the default: three stocks, about 80 seconds, then sudden death if more than one ball remains. Falling off the arena is the knockout. A faster, heavier contact launches a slower ball. Dash is a redirect with a cooldown, and a dash on landing is a **perfect dash**: stronger, partly refunded, and called out on screen. Abilities are decisions, not flat power.
+
+A dash or ability pressed up to 150 ms before its cooldown ends is buffered and fires the moment it is ready (`inputBuffer`). The open arenas (Classic, Pinball, Gravity, Ricochet, Turbine) start tightening at 30 seconds, so a match builds toward its finish instead of stalling (`shrinkRate`, `shrinkDelay` in `src/data/content.ts`).
 
 **Heat.** Every hit you take raises your heat, shown as the % beside your name and above your speed gauge. Each 100% makes the next launch 80% stronger. Heat resets when you lose a stock, so a stock builds from safe trades to a dangerous finish. Glancing bumps barely count; committed strikes do. Tuning is in `src/data/tuning.ts` (`heatGain`, `heatScale`).
 
@@ -37,13 +39,13 @@ Free-for-all is the default: three stocks, about 80 seconds, then sudden death i
 
 **Daily Twist.** The menu features one mode and two mutators each day, the same for everyone on that date: low gravity, giants, hyper speed, dash frenzy, glass cannons, black ice, or overheat. See `MUTATORS` and `dailyTwist` in `src/data/content.ts`.
 
-**Bots.** Bots re-aim often but only commit to a dash or ability after a human reaction time: about 420 ms for a rookie and 180 ms for a champion. Their aim error shrinks with skill but never reaches zero, and they spread out instead of piling onto one ball. In casual play, a player's first matches use slower bots that give humans a short warm-up, and a run of bottom-half finishes eases them a little. Only bot pace and aim change, never the physics, and never in ranked (`botEase` in `src/game/setup.ts`).
+**Bots.** Bots re-aim often but only commit to a dash or ability after a human reaction time: about 420 ms for a rookie and 180 ms for a champion. Edge saves have a reaction time too (about 240 ms for a rookie, 60 ms for a champion), so a well-aimed launch can beat a bot's recovery. Their aim error shrinks with skill but never reaches zero, and they spread out instead of piling onto one ball. In casual play, a player's first matches use slower bots that give humans a short warm-up, and a run of bottom-half finishes eases them a little. Only bot pace and aim change, never the physics, and never in ranked (`botEase` in `src/game/setup.ts`).
 
 Ranked matches use a standard ball (stable core, rubber shell, no passive). The ability you picked is the only signature. Account level, mastery, and cosmetics do not change competitive hits.
 
 ## Progression
 
-Everything earned is cosmetic or coins. Nothing changes a hit.
+Everything earned is cosmetic or coins. Nothing changes a hit. Pick your name and ball colour in Loadout, which also shows your core and shell as stat bars against the Stable/Rubber baseline. In menus, Q and E switch top tabs and Esc goes back.
 
 - **Account level** (cap 80): coins every level, a bigger payout every fifth, cosmetics through level 30. Match xp is itemized on the results screen: placement, knockouts, time, day streak, first win of the day, win streak.
 - **Mastery**: ten levels for each core and each ability. Level-ups pay coins, cores unlock cosmetics, and every ability has a title at mastery 5. Forfeits earn none.
@@ -56,7 +58,10 @@ Rewards added after a player already passed them are paid when the profile loads
 
 ## Feel, audio, and accessibility
 
-- The sim ticks at a fixed 60 Hz. The renderer blends between ticks, so motion stays smooth on 120/144 Hz screens.
+- The camera is pitched, so arenas read as thick floating platforms over a void. It frames the live balls and pushes in as the field thins out.
+- Balls are characters: their eyes follow their travel, they squint when hit, panic near the edge, get determined at full speed, and celebrate a win. All skins render as their own material (glass, chrome, ember, nebula, prism, frost, glacier, hollow, ringed). Players drop in from the sky at the start and on respawn.
+- The HUD uses Smash-style player cards (heat %, stocks), a speed dial, and cooldown rings. Your knockouts and streaks get a callout.
+- The sim ticks at a fixed 60 Hz. The renderer blends between ticks, so motion stays smooth on 120/144 Hz screens. It keeps the canvas under about 4 MP and lowers its resolution on its own if frames run long.
 - Hitstop scales with hit power, and the struck ball shudders during the freeze. Shake is trauma based, and the deciding knockout gets a slow-motion finish.
 - Audio is fully procedural. Every ability has its own sound, sounds are panned by position and capped per voice, and the music ducks on knockouts, all through a master limiter. The music is a sequencer with layers that build from menu to match to final phase to sudden death.
 - Leaving the tab pauses the match and silences audio.
@@ -71,7 +76,7 @@ Production builds register a service worker (`public/sw.js`) and ship a web mani
 - `src/sim` authoritative match, physics, hazards, abilities, bots, replay input log
 - `src/data` tuning and content definitions
 - `src/progression` profile, rank, challenges, season track
-- `src/render`, `src/audio`, `src/ui` presentation
+- `src/render`, `src/audio`, `src/ui` presentation (`render/ball.ts` paints the ball characters for both the arena and the UI; `ui/icons.ts` is the inline icon set)
 - `src/game` setup and the browser shell
 
 The session accepts inputs only. Positions, eliminations, and rewards come from the sim. A network adapter can feed the same `submit` path later.

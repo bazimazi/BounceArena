@@ -46,6 +46,8 @@ export const TUNE = {
   heatMax: 250,
   /** Most a victim can bend a launch with the stick, in radians (~9 degrees). */
   diAngle: 0.15,
+  /** A dash or ability pressed this close to coming off cooldown fires the moment it is ready. */
+  inputBuffer: 0.15,
 } as const
 
 export interface CoreDef {

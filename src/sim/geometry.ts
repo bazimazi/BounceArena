@@ -116,7 +116,32 @@ export function supportAt(solids: SolidDef[], x: number, y: number, time: number
     }
     if (!best || candidate.edgeDist > best.edgeDist) best = candidate
   }
-  return best ?? NONE
+  return best ?? farFrom(solids, x, y, time, shrink)
+}
+
+/** Off every floor: still point back toward the nearest one, so a recovery has a direction. */
+function farFrom(solids: SolidDef[], x: number, y: number, time: number, shrink: Shrink): Support {
+  let bx = 0
+  let by = -1
+  let bestD = Infinity
+  for (const solid of solids) {
+    const pose = solidPose(solid, time, shrink)
+    if (!pose.active) continue
+    const c = pose.shape === 'poly' ? centroid(pose.points) : { x: pose.x, y: pose.y }
+    const dx = c.x - x
+    const dy = c.y - y
+    const l = Math.hypot(dx, dy)
+    if (l < 1e-6) continue
+    // Inside a ring's hole the floor is outward, not toward the centre.
+    const inHole = pose.shape === 'ring' && l < pose.inner
+    const d = inHole ? pose.inner - l : l - (pose.shape === 'poly' ? 0 : pose.r)
+    if (d < bestD) {
+      bestD = d
+      bx = (inHole ? -dx : dx) / l
+      by = (inHole ? -dy : dy) / l
+    }
+  }
+  return { ...NONE, safetyX: bx, safetyY: by }
 }
 
 function insidePose(pose: Pose, x: number, y: number): { inside: boolean; edgeDist: number; safetyX: number; safetyY: number } {
@@ -155,11 +180,13 @@ function insidePose(pose: Pose, x: number, y: number): { inside: boolean; edgeDi
       sy = inward.y
     }
   }
+  // A horizontal inward normal has sy === 0, so test for "no edge found", not for a falsy value.
+  const found = best < Infinity
   return {
     inside,
     edgeDist: inside ? best : -best,
-    safetyX: sx || 0,
-    safetyY: sy || -1,
+    safetyX: found ? sx : 0,
+    safetyY: found ? sy : -1,
   }
 }
 

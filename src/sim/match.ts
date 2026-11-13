@@ -74,6 +74,7 @@ export class Match {
   live: LiveScript[] = []
   extras: HazardDef[] = []
   laserSpawned = false
+  shrinkAnnounced = false
   banner: Banner | null = null
   feed: FeedItem[] = []
   moments: Moment[] = []
@@ -246,8 +247,29 @@ export class Match {
     b.prevDash = b.input.dash
     b.prevAbility = b.input.ability
     b.prevEmote = b.input.emote
-    if (dashEdge) this.doDash(b)
+    // Presses just before a cooldown ends are buffered, so a slightly early input is not lost.
+    if (dashEdge) {
+      if (b.dashCd > 0 && b.dashCd <= TUNE.inputBuffer) b.dashBuffer = TUNE.inputBuffer
+      else this.doDash(b)
+    } else if (b.dashBuffer > 0) {
+      b.dashBuffer = Math.max(0, b.dashBuffer - DT)
+      if (b.dashCd <= 0) {
+        b.dashBuffer = 0
+        this.doDash(b)
+      }
+    }
+    let cast = false
     if (abilityEdge) {
+      if (b.abilityCd > 0 && b.abilityCd <= TUNE.inputBuffer) b.abilityBuffer = TUNE.inputBuffer
+      else cast = true
+    } else if (b.abilityBuffer > 0) {
+      b.abilityBuffer = Math.max(0, b.abilityBuffer - DT)
+      if (b.abilityCd <= 0) {
+        b.abilityBuffer = 0
+        cast = true
+      }
+    }
+    if (cast && b.abilityCd <= 0) {
       const hits = castAbility(b, {
         bodies: this.bodies,
         time: this.time,
@@ -260,7 +282,8 @@ export class Match {
           this.bodies.push(d)
         },
       })
-      this.pushFx({ type: 'ability', x: b.x, y: b.y, power: hits, color: b.color, actorId: b.id, victimId: '', text: b.ability })
+      // A blink with no floor ahead refunds itself; only a real cast gets effects.
+      if (b.abilityCd > 1) this.pushFx({ type: 'ability', x: b.x, y: b.y, power: hits, color: b.color, actorId: b.id, victimId: '', text: b.ability })
     }
     if (emoteEdge && b.emoteCd <= 0) {
       b.emoteText = EMOTE[b.emote] ?? '...'
@@ -292,7 +315,9 @@ export class Match {
     b.dashTime = TUNE.dashWindow
     b.dashCd = b.dashCdMax
     b.stats.dashes += 1
+    let perfect = false
     if (b.sinceLand < TUNE.perfectDashWindow && b.supported && !b.falling) {
+      perfect = true
       b.perfectFlash = 0.28
       b.dashCd = Math.max(0, b.dashCd - TUNE.perfectDashRefund)
       b.vx *= TUNE.perfectDashBoost
@@ -301,7 +326,7 @@ export class Match {
     }
     capSpeed(b, SPEED_CAP)
     b.anchorTime = 0
-    this.pushFx({ type: 'dash', x: b.x, y: b.y, power: dashSpeed, color: b.color, actorId: b.id, victimId: '', text: '' })
+    this.pushFx({ type: 'dash', x: b.x, y: b.y, power: dashSpeed, color: b.color, actorId: b.id, victimId: '', text: perfect ? 'perfect' : '' })
   }
 
   private substep(dt: number): void {
@@ -607,6 +632,10 @@ export class Match {
     if (this.config.duration > 0 && this.time >= this.finalAt && !this.finalPhase && (this.status === 'playing' || this.status === 'sudden')) {
       this.finalPhase = true
       this.announce('FINAL PHASE', 'The arena gets mean', 3)
+    }
+    if (!this.shrinkAnnounced && this.arena.shrinkRate > 0 && this.time >= this.arena.shrinkDelay && this.config.duration > 0) {
+      this.shrinkAnnounced = true
+      this.announce('ARENA SHRINKING', 'The edge is coming in', 2)
     }
     if (this.finalPhase && !this.laserSpawned && this.arena.final === 'laser') {
       this.laserSpawned = true
