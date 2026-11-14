@@ -117,6 +117,11 @@ export class AudioBus {
         if (!this.voice('dash', 2)) return
         this.whoosh(pan, local ? 0.12 : 0.05, 700, 2600, 0.16)
         this.chirp(320, 900, 0.09, local ? 0.05 : 0.02, 'sine', pan)
+        if (event.text === 'recover') {
+          // A rising hop: you pulled it back from the void.
+          this.chirp(300, 1100, 0.16, local ? 0.06 : 0.025, 'triangle', pan)
+          if (local) this.note(hz(28), 0.16, 'triangle', 0.04, this.sfx!, this.now() + 0.1, pan)
+        }
         if (event.text === 'perfect' && local) {
           // A bright two-note sparkle confirms the timing.
           this.note(hz(31), 0.12, 'triangle', 0.05, this.sfx!, this.now() + 0.02, pan)
@@ -147,11 +152,23 @@ export class AudioBus {
         this.boom(pan, 0.7)
         return
       case 'save':
+        if (event.text === 'edge' && !local) return
         this.note(hz(19), 0.09, 'triangle', 0.06, this.sfx!, this.now(), pan)
         this.note(hz(26), 0.16, 'triangle', 0.06, this.sfx!, this.now() + 0.07, pan)
         return
       case 'spawn':
         this.chirp(600, 1200, 0.25, 0.025, 'sine', pan)
+        return
+      case 'launch':
+        // A rising whistle: the ball has been sent and cannot act yet.
+        if (!this.voice('launch', 2)) return
+        this.chirp(520, 1900, 0.18 + event.power * 0.6, local ? 0.045 : 0.02, 'triangle', pan, 3600)
+        this.whoosh(pan, local ? 0.08 : 0.04, 1800, 5200, 0.3)
+        return
+      case 'teeter':
+        // A nervous wobble on the brink, mostly for your own ball.
+        if (!local || !this.voice('teeter', 1, 300)) return
+        ;[0, 1, 2].forEach((i) => this.note(hz(i % 2 ? 22 : 21), 0.05, 'square', 0.02, this.sfx!, this.now() + i * 0.06, pan))
         return
       default:
         return

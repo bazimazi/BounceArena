@@ -76,6 +76,10 @@ export function buildMatchConfig(profile: Profile, options: PlayOptions): MatchC
       pace: ease < 1 ? 0.62 + ease * 0.38 : 1,
     })
   }
+  if (options.modeId === 'tutorial' && players[1]) {
+    // A readable sparring partner: light, no passive, the most visible ability.
+    Object.assign(players[1], { core: 'light', shell: 'rubber', passive: 'none', ability: 'shockwave' })
+  }
   if (options.localDuo && players[1]) {
     const mate = players[1]
     mate.id = 'p2'

@@ -637,7 +637,7 @@ export const MODES: ModeDef[] = [
     respawn: 'always',
     events: 'standard',
     zone: false,
-    scoreLimit: 700,
+    scoreLimit: 2000,
     ranked: true,
   },
   {
@@ -702,7 +702,7 @@ export const MODES: ModeDef[] = [
     minPlayers: 2,
     maxPlayers: 2,
     stocks: 3,
-    duration: 60,
+    duration: 90,
     teams: false,
     win: 'last',
     suddenDeath: true,

@@ -54,7 +54,10 @@ class App {
     this.input.onPause = () => this.togglePause()
     this.bindTouch()
     this.renderer.resize()
-    window.addEventListener('resize', () => this.renderer.resize())
+    window.addEventListener('resize', () => {
+      this.renderer.resize()
+      this.measureHud()
+    })
     // Browsers only allow audio after a gesture; the first one starts the menu music too.
     const unlock = () => {
       this.audio.resume()
@@ -84,6 +87,31 @@ class App {
     return clamp(this.profile.settings.practiceSpeed || 1, 0.5, 1)
   }
 
+  /** Once you are out, the rest of the match fast-forwards so nobody waits long for results. */
+  private spectateSpeed(): number {
+    const match = this.session?.match
+    if (this.highlight || !match || this.screen !== 'match') return 1
+    if (match.status !== 'playing' && match.status !== 'sudden') return 1
+    const you = match.players.find((p) => p.id === this.youId)
+    if (!you?.eliminated) return 1
+    // Two local players: the second is still playing, so real time.
+    if (this.lastOptions?.localDuo && match.players.some((p) => p.id === 'p2' && !p.eliminated)) return 1
+    return 2.2
+  }
+
+  /** How far down the top HUD reaches, so the camera frames the arena below the timer and cards. */
+  private measureHud(): void {
+    window.setTimeout(() => {
+      if (this.screen !== 'match') return
+      let bottom = 0
+      for (const node of hudRoot.querySelectorAll<HTMLElement>('.hud-top, .hud-cards')) {
+        const r = node.getBoundingClientRect()
+        if (r.height > 0 && r.top < window.innerHeight * 0.3) bottom = Math.max(bottom, r.bottom)
+      }
+      this.renderer.insetTop = bottom
+    }, 120)
+  }
+
   private autoPause(): void {
     const match = this.session?.match
     if (this.screen !== 'match' || !match || this.paused) return
@@ -106,7 +134,7 @@ class App {
       return
     }
     const live = this.highlight || (this.session && this.screen === 'match' && !this.paused)
-    this.acc += dt * (live ? this.renderer.timeScale(dt) * this.assistSpeed() : 1)
+    this.acc += dt * (live ? this.renderer.timeScale(dt) * this.assistSpeed() * this.spectateSpeed() : 1)
     let steps = 0
     while (this.acc >= DT && steps < 5) {
       this.tick()
@@ -214,6 +242,8 @@ class App {
     uiRoot.replaceChildren()
     hudRoot.hidden = false
     this.shell.mountHud()
+    this.renderer.insetTop = 0
+    this.measureHud()
     this.shell.onPause = () => this.togglePause()
     this.shell.onResume = () => this.togglePause()
     this.shell.onForfeit = () => this.leaveMatch()
@@ -315,11 +345,15 @@ class App {
   }
 
   private hint(match: Match): string {
-    if (this.profile.matches > 1 && this.profile.tutorialDone) return ''
     const you = match.players.find((p) => p.id === this.youId)
-    if (!you) return ''
+    if (!you || !you.alive) return ''
     const taught = this.profile.taught
     const touch = window.matchMedia('(pointer: coarse)').matches
+    // Situational coaching comes first and shows to everyone until they have done it once:
+    // hanging off the edge and being launched are the two moments that decide a stock.
+    if (!taught.claw && you.teeter > 0 && you.edgeDist < 0) return touch ? 'Hanging on! Drag toward the floor to climb back.' : 'Hanging on! Hold toward the floor to climb back.'
+    if (!taught.recover && you.stun > 0) return touch ? 'Launched! Tap DASH toward the floor. It fires the moment you can move.' : 'Launched! Press dash toward the floor. It fires the moment you can move.'
+    if (this.profile.matches > 1 && this.profile.tutorialDone) return ''
     const keys = touch
       ? { steer: 'Touch and drag anywhere on the left to steer', dash: 'Tap DASH to burst forward', ability: 'the ability button', brake: 'BRAKE slows you' }
       : { steer: 'WASD to steer', dash: 'Space dashes', ability: 'F', brake: 'Shift brakes' }
@@ -333,7 +367,7 @@ class App {
     if (you.stats.dashes > 0) taught.dash = true
     if (!taught.ability && you.stats.abilityUses < 1) return `${abilityById(you.ability).name} is ${keys.ability}. It is a decision, not a stat.`
     if (you.stats.abilityUses > 0) taught.ability = true
-    if (!taught.edge && you.edgeDist < 110) return `The edge is out. ${keys.brake}. Dash back toward the floor.`
+    if (!taught.edge && you.edgeDist < 110) return `The edge is out. ${keys.brake}. Go over and you hang on for a moment: steer home.`
     if (you.stats.escapes > 0) taught.edge = true
     if (!taught.heat && you.heat >= 25) return 'Heat (the % by your name) rises with every hit you take. Hotter balls fly farther.'
     if (you.heat >= 25 && you.stats.survival > 3) taught.heat = true
@@ -352,6 +386,11 @@ class App {
       const local = e.actorId === this.youId || e.victimId === this.youId
       this.audio.fx(e, local, clamp(e.x / view, -1, 1) * 0.7)
       if (local && !match.silent && !this.highlight) this.feel(e)
+      // Doing it once is enough to retire the coaching line.
+      if (!this.highlight && e.actorId === this.youId) {
+        if (e.type === 'save' && e.text === 'edge') this.profile.taught.claw = true
+        if (e.type === 'dash' && e.text === 'recover') this.profile.taught.recover = true
+      }
       if (e.type === 'elim') {
         const victim = match.players.find((p) => p.id === e.victimId)
         this.lastElim = { x: e.x, y: e.y, color: victim?.color ?? e.color, time: match.time }
@@ -392,6 +431,13 @@ class App {
       ms = 90
       strong = 0.6
       weak = 0.3
+    } else if (e.type === 'launch' && e.victimId === this.youId) {
+      ms = 140
+      strong = 0.85
+      weak = 0.5
+    } else if (e.type === 'teeter') {
+      ms = 45
+      weak = 0.55
     }
     if (!ms) return
     this.input.rumble(0, strong, weak, ms)
@@ -670,3 +716,5 @@ class App {
 
 const app = new App()
 app.start()
+// Dev builds expose the app so automated play tests can read match state.
+if (import.meta.env.DEV) (window as unknown as { __app: App }).__app = app

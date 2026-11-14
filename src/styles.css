@@ -769,23 +769,46 @@ input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius
 .hint {
   bottom: 124px; left: 50%; transform: translateX(-50%);
   display: flex; align-items: center; gap: 8px; background: rgba(10, 12, 30, 0.88); border: 1px solid rgba(255, 193, 77, 0.4); padding: 9px 16px; border-radius: 14px;
-  max-width: min(560px, calc(100% - 24px)); text-align: center; font-size: 0.9rem; font-weight: 600; animation: rise 0.4s var(--ease-out); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  width: max-content; max-width: min(560px, calc(100vw - 24px)); text-align: center; font-size: 0.9rem; font-weight: 600; animation: hint-in 0.4s var(--ease-out); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
 }
-.hint::before { content: "TIP"; font-size: 0.6rem; font-weight: 900; letter-spacing: 0.16em; padding: 3px 6px; border-radius: 5px; background: var(--gold); color: #1d1200; }
+.hint::before { content: "TIP"; flex: none; font-size: 0.6rem; font-weight: 900; letter-spacing: 0.16em; padding: 3px 6px; border-radius: 5px; background: var(--gold); color: #1d1200; }
+.hint { transition: opacity 0.2s; }
+/* Keeps the centring transform while it rises in (the shared rise animation would drop it). */
+@keyframes hint-in { from { opacity: 0; transform: translate(-50%, 12px) scale(0.97); } to { opacity: 1; transform: translateX(-50%); } }
+#hud.bannering .hint { opacity: 0; }
 
-.spectate { top: 130px; left: 50%; transform: translateX(-50%); text-align: center; display: flex; flex-direction: column; gap: 4px; animation: slam-in 0.5s var(--ease-back); white-space: nowrap; }
+.spectate { bottom: 116px; left: 50%; transform: translateX(-50%); text-align: center; display: flex; flex-direction: column; gap: 4px; animation: slam-in 0.5s var(--ease-back); white-space: nowrap; }
 .spectate strong { font-family: var(--display); font-weight: 400; font-size: 2.3rem; color: var(--coral); letter-spacing: 0.04em; text-shadow: 0 4px 0 rgba(0, 0, 0, 0.5); }
 .spectate small { color: var(--dim); font-weight: 700; letter-spacing: 0.12em; }
+.spectate .ff { align-self: center; display: inline-flex; align-items: center; gap: 2px; padding: 4px 12px 4px 8px; border-radius: 99px; background: rgba(10, 12, 30, 0.85); border: 1px solid rgba(89, 212, 255, 0.5); color: var(--ice); font-size: 0.7rem; font-weight: 900; letter-spacing: 0.18em; animation: throb 1.2s ease-in-out infinite; }
+.spectate .ff .ico { width: 14px; height: 14px; margin-right: -6px; }
+.spectate .ff .ico + .ico { margin-right: 4px; }
 @keyframes slam-in { from { opacity: 0; transform: translateX(-50%) scale(2); } to { opacity: 1; transform: translateX(-50%) scale(1); } }
 #hud.out .hud-actions, #hud.out .hint { display: none; }
 
-.intro { --tone: #ff4d3a; top: 15%; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center; animation: intro-in 0.7s var(--ease-back); }
+.intro { --tone: #ff4d3a; top: 84px; left: 50%; transform: translateX(-50%); width: min(920px, calc(100vw - 32px)); display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center; animation: intro-in 0.7s var(--ease-back); }
 .intro-mode { display: inline-flex; align-items: center; gap: 8px; padding: 5px 14px; border-radius: 99px; background: color-mix(in srgb, var(--tone) 85%, #000); color: #fff; font-weight: 900; font-size: 0.78rem; letter-spacing: 0.18em; text-transform: uppercase; box-shadow: 0 6px 20px color-mix(in srgb, var(--tone) 40%, transparent); }
 .intro-mode .ico { width: 18px; height: 18px; }
 .intro strong { font-family: var(--display); font-weight: 400; font-size: 3.2rem; line-height: 1; letter-spacing: 0.02em; text-shadow: 0 5px 0 rgba(0, 0, 0, 0.45), 0 0 30px rgba(0, 0, 0, 0.5); }
 .intro small { color: #dfe5ff; font-weight: 600; font-size: 0.9rem; max-width: 46ch; text-shadow: 0 2px 6px rgba(0, 0, 0, 0.8); }
 .intro .muts { justify-content: center; }
 @keyframes intro-in { from { opacity: 0; transform: translate(-50%, -24px) scale(0.92); } }
+/* Countdown lineup: everyone in the match slides in, yours first. */
+.lineup { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 12px; }
+.lu {
+  --c: #fff; display: flex; align-items: center; gap: 8px; padding: 4px 14px 4px 5px; border-radius: 99px;
+  background: linear-gradient(180deg, rgba(20, 24, 54, 0.9), rgba(10, 12, 30, 0.9)); border: 1px solid var(--line);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35), inset 0 -2px 0 color-mix(in srgb, var(--c) 80%, transparent);
+  opacity: 0; animation: lu-in 0.45s var(--ease-back) var(--d, 0ms) forwards;
+}
+.lu.you { border-color: rgba(255, 193, 77, 0.8); box-shadow: 0 0 0 1px rgba(255, 193, 77, 0.45), 0 6px 18px rgba(0, 0, 0, 0.35), inset 0 -2px 0 var(--c); }
+.lu canvas { flex: none; }
+.lu-meta { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.05; }
+.lu-meta b { font-weight: 800; font-size: 0.86rem; white-space: nowrap; }
+.lu-meta small { font-size: 0.56rem; font-weight: 900; letter-spacing: 0.16em; color: var(--dim); }
+.lu.you .lu-meta small { color: var(--gold); }
+@keyframes lu-in { from { opacity: 0; transform: translateY(14px) scale(0.85); } to { opacity: 1; transform: none; } }
+#hud.counting .hint { display: none; }
 
 .pause { top: 14px; right: 16px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: rgba(10, 12, 30, 0.8); padding: 9px 14px; border-radius: 13px; letter-spacing: 0.14em; font-size: 0.74rem; font-weight: 800; backdrop-filter: blur(8px); transition: border-color 0.2s; }
 .pause .ico { width: 16px; height: 16px; }
@@ -826,13 +849,24 @@ input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius
 #btn-dash:not(.ready), #btn-ability:not(.ready) { filter: saturate(0.3) brightness(0.7); }
 #btn-brake { position: absolute; right: 30px; bottom: 236px; width: 70px; height: 46px; border-radius: 14px; }
 
-#btn-ability span, #btn-dash span { display: block; max-width: 66px; margin: 0 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#btn-ability span, #btn-dash span { display: block; max-width: 70px; margin: 0 auto; line-height: 1.05; text-align: center; }
+#btn-ability span { font-size: 0.54rem; letter-spacing: 0.02em; }
 @media (pointer: coarse) {
   body[data-mode="match"] #touch { display: block; }
   body[data-mode="match"] .hud-actions { display: none; }
-  body[data-mode="match"] .hud-cards { top: 74px; bottom: auto; left: 12px; max-width: calc(100vw - 24px); }
-  body[data-mode="match"] .hint { bottom: auto; top: 150px; }
+  body[data-mode="match"] .hud-cards { top: 74px; bottom: auto; left: 12px; right: 12px; max-width: none; }
+  body[data-mode="match"] .hint { bottom: auto; top: 136px; font-size: 0.8rem; padding: 7px 12px; }
+  body[data-mode="match"] .banner { top: 27%; }
   body[data-mode="match"] .ko-toast { top: 44%; }
+  body[data-mode="match"] .callout { top: 132px; }
+  /* Out of the match: no controls to press, the spectate panel takes the bottom. */
+  body[data-out="yes"] #touch { display: none !important; }
+  body[data-mode="match"] .spectate { bottom: 44px; }
+  /* During the countdown the intro owns the top of the screen. */
+  #hud.counting .hud-cards, #hud.counting .hud-top { visibility: hidden; }
+  #hud.counting .intro { top: 14px; }
+  body[data-mode="match"] .pause:not([data-act="end"]) span { display: none; }
+  body[data-mode="match"] .pause:not([data-act="end"]) { padding: 10px; }
 }
 /* Landscape phones: stack the cards down the left edge so the arena keeps its height. */
 @media (pointer: coarse) and (max-height: 500px) {
@@ -888,12 +922,33 @@ input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius
   .settings-grid { grid-template-columns: 1fr; }
   .xp-lines, .res-mastery { grid-template-columns: 1fr; }
   .res-stats { grid-template-columns: 1fr 1fr; }
-  .results { padding: 16px 12px; }
+  .results { padding: 16px 12px 104px; }
+  /* Phones: rematch is always one thumb away, not below the fold. */
+  .res-actions.dock { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; margin: 0; padding: 22px 12px calc(12px + env(safe-area-inset-bottom)); background: linear-gradient(180deg, transparent, rgba(5, 7, 20, 0.94) 38%); animation: rise 0.5s var(--ease-out) 0.3s both; grid-template-columns: 1fr 1fr; }
+  .res-actions.dock .cta-play { grid-column: span 2; height: 62px; font-size: 2rem; }
+  .res-actions.dock .cta-play kbd { display: none; }
+  .results { padding-bottom: 170px; }
+  /* The rewards toast becomes a bottom sheet so it never covers your ball. */
+  .toasts { top: auto; bottom: calc(14px + env(safe-area-inset-bottom)); left: 12px; right: 12px; width: auto; }
   .hud-feed { display: none; }
+  /* Compact chips: heat and stocks only, colour on the base line. No avatars to squeeze. */
+  .pcard { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 0; padding: 5px 4px 6px; border-radius: 12px; }
+  .pc-av { display: none !important; }
   .pc-name { display: none; }
-  .pcard { min-width: 64px; padding: 6px 8px; }
-  .pc-av { width: 30px !important; height: 30px !important; }
-  .pc-heat { font-size: 1.35rem; }
+  .pc-body { align-items: center; }
+  .pc-heat { font-size: 1.3rem; transform-origin: center; }
+  .pc-stocks { justify-content: center; grid-column: auto; }
+  .pc-sub { position: static; font-size: 0.55rem; }
+  .pcard.you { transform: none; }
+  .pcard.you::before { left: 50%; transform: translateX(-50%); top: -8px; }
+  .intro { top: 76px; }
+  .intro strong { font-size: 2.3rem; }
+  .intro small { font-size: 0.8rem; }
+  .lineup { gap: 6px; margin-top: 8px; }
+  .lu { padding: 3px 10px 3px 4px; }
+  .lu canvas { width: 26px !important; height: 26px !important; }
+  .lu-meta b { font-size: 0.74rem; }
+  .lu-meta small { display: none; }
   .banner strong { font-size: 2.2rem; padding: 4px 30px; }
   .ko-toast strong { font-size: 2.4rem; }
   .timer { font-size: 2rem; min-width: 86px; }
@@ -921,12 +976,9 @@ input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius
   .topright { gap: 6px; }
   .icon-btn { width: 38px; height: 38px; }
   .hud-cards { gap: 4px; }
-  .pcard { min-width: 0; padding: 5px 6px; column-gap: 4px; border-radius: 12px; }
-  .pc-av { width: 24px !important; height: 24px !important; }
-  .pc-heat { font-size: 1.1rem; }
+  .pc-heat { font-size: 1.12rem; }
   .pc-stocks i { width: 6px; height: 6px; }
   .pcard.you::before { display: none; }
-  .hud-cards.many .pc-av { display: none !important; }
   .mode-grid { grid-template-columns: 1fr 1fr; }
   .mode-card small { display: none; }
   .choice-grid, .item-grid { grid-template-columns: 1fr 1fr; }

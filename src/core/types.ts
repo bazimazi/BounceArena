@@ -159,6 +159,8 @@ export interface FxEvent {
     | 'wall'
     | 'spawn'
     | 'save'
+    | 'launch'
+    | 'teeter'
   x: number
   y: number
   power: number

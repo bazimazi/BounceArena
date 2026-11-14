@@ -1,7 +1,7 @@
 import { TAU, clamp } from '../core/math'
 import { hexA, mixHex, shade } from './util'
 
-export type Expression = 'idle' | 'focus' | 'hurt' | 'scared' | 'happy' | 'sleep'
+export type Expression = 'idle' | 'focus' | 'hurt' | 'scared' | 'happy' | 'sleep' | 'dizzy'
 
 export interface BallLook {
   color: string
@@ -425,7 +425,28 @@ function face(ctx: CanvasRenderingContext2D, r: number, look: BallLook): void {
     const y = cy
     ctx.save()
     ctx.translate(x, y)
-    if (ex === 'hurt') {
+    if (ex === 'dizzy') {
+      // Spinning spirals: knocked silly by a launch.
+      ctx.fillStyle = '#ffffff'
+      ctx.beginPath()
+      ctx.ellipse(0, 0, ew * 1.05, eh * 0.95, 0, 0, TAU)
+      ctx.fill()
+      ctx.strokeStyle = ink
+      ctx.lineWidth = lw * 0.85
+      ctx.lineCap = 'round'
+      ctx.beginPath()
+      const spin = look.time * 14 * side
+      for (let k = 0; k <= 26; k++) {
+        const u = k / 26
+        const a = spin + u * TAU * 2.2
+        const rr = u * 0.85
+        const px = Math.cos(a) * ew * rr
+        const py = Math.sin(a) * eh * rr
+        if (k === 0) ctx.moveTo(px, py)
+        else ctx.lineTo(px, py)
+      }
+      ctx.stroke()
+    } else if (ex === 'hurt') {
       // >  < squeezed shut.
       ctx.strokeStyle = ink
       ctx.lineWidth = lw * 1.25
@@ -514,6 +535,16 @@ function face(ctx: CanvasRenderingContext2D, r: number, look: BallLook): void {
     ctx.beginPath()
     ctx.ellipse(cx, my + eh * 0.2, ew * 0.38, eh * 0.32, 0, 0, TAU)
     ctx.fill()
+  } else if (ex === 'dizzy') {
+    ctx.beginPath()
+    for (let k = 0; k <= 8; k++) {
+      const u = k / 8
+      const x = cx - gap * 0.5 + u * gap
+      const y = my + eh * 0.15 + Math.sin(u * TAU * 1.5 + look.time * 18) * eh * 0.14
+      if (k === 0) ctx.moveTo(x, y)
+      else ctx.lineTo(x, y)
+    }
+    ctx.stroke()
   } else if (ex === 'hurt') {
     ctx.beginPath()
     ctx.moveTo(cx - gap * 0.45, my + eh * 0.1)

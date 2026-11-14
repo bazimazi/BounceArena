@@ -40,14 +40,43 @@ export const TUNE = {
   friendlyBump: 0.28,
   edgeWarn: 86,
   /** Heat gained per point of launch power above 60. A 500 hit adds about 17%. */
-  heatGain: 0.038,
+  heatGain: 0.046,
   /** Extra launch per 100% heat. */
   heatScale: 0.8,
+  /**
+   * Strike launch before heat. Kept well under the speed cap so a fresh ball survives a hit near
+   * the rim and heat is what turns the same hit into a knockout.
+   */
+  launchScale: 0.7,
   heatMax: 250,
   /** Most a victim can bend a launch with the stick, in radians (~9 degrees). */
   diAngle: 0.15,
   /** A dash or ability pressed this close to coming off cooldown fires the moment it is ready. */
   inputBuffer: 0.15,
+  /**
+   * Launch stun. A strike whose heat-scaled power (uncapped) passes `stunFloor` takes control away
+   * for a moment, so a big launch carries the ball before anyone, bot or human, can dash it back.
+   * Heat keeps mattering past the speed cap because the stun grows with uncapped power.
+   */
+  stunFloor: 650,
+  stunPer: 0.0006,
+  stunMax: 0.45,
+  /** A dash toward the floor while falling pops the ball back up a little: the recovery. */
+  recoverHop: 150,
+  /** Speed of the cooldown-free recovery dash you get once per trip over the edge. */
+  recoverSpeed: 560,
+  recoverDepth: -18,
+  /**
+   * Teeter: a ball that goes over the edge without launch stun (an overshoot, a light hit) hangs
+   * on the brink this much longer, and its outward speed bleeds off, so an overshoot can be saved
+   * with a quick dash or steer. A launched ball gets none of this. The edge belongs to the hitter.
+   */
+  teeter: 0.2,
+  teeterDrag: 7,
+  /** Pull toward the floor while teetering and holding the stick home. */
+  clawAccel: 1800,
+  /** After a hit this light, the rim assist comes back after this many seconds. */
+  rimGrace: 0.3,
 } as const
 
 export interface CoreDef {
@@ -115,30 +144,30 @@ export const CORES: CoreDef[] = [
     id: 'heavy',
     name: 'Heavy',
     blurb: 'You launch people and hate being moved. Turning at speed is a commitment.',
-    mass: 1.36,
+    mass: 1.15,
     accel: 0.84,
-    radius: 26,
+    radius: 24,
     maxSpeed: 0.92,
-    outgoing: 1.14,
-    incoming: 0.76,
-    turn: 0.88,
+    outgoing: 1,
+    incoming: 0.96,
+    turn: 0.86,
     dash: 0.94,
-    dashCd: 1.05,
+    dashCd: 1.08,
     restitution: 0.96,
   },
   {
     id: 'light',
     name: 'Light',
     blurb: 'Fast and slippery. You set up angles, then get sent if you trade head-on.',
-    mass: 0.7,
-    accel: 1.22,
-    radius: 18,
-    maxSpeed: 1.14,
-    outgoing: 0.84,
-    incoming: 1.22,
-    turn: 1.14,
-    dash: 1.06,
-    dashCd: 0.92,
+    mass: 0.9,
+    accel: 1.28,
+    radius: 20,
+    maxSpeed: 1.12,
+    outgoing: 1,
+    incoming: 1,
+    turn: 1.18,
+    dash: 1.08,
+    dashCd: 0.82,
     restitution: 1.04,
   },
   {
@@ -149,12 +178,12 @@ export const CORES: CoreDef[] = [
     accel: 1.04,
     radius: 21,
     maxSpeed: 1.04,
-    outgoing: 0.96,
-    incoming: 1.06,
+    outgoing: 1,
+    incoming: 1,
     turn: 1.04,
     dash: 1,
     dashCd: 1,
-    restitution: 1.08,
+    restitution: 1.1,
   },
   {
     id: 'aggressive',
@@ -164,11 +193,11 @@ export const CORES: CoreDef[] = [
     accel: 1.08,
     radius: 22,
     maxSpeed: 1.06,
-    outgoing: 1.08,
-    incoming: 1.06,
+    outgoing: 1,
+    incoming: 1.1,
     turn: 0.84,
-    dash: 1.22,
-    dashCd: 0.86,
+    dash: 1.16,
+    dashCd: 0.9,
     restitution: 0.98,
   },
 ]
@@ -258,14 +287,14 @@ export const PASSIVES: PassiveDef[] = [
 
 export const ABILITIES: AbilityDef[] = [
   { id: 'shockwave', name: 'Shockwave', blurb: 'Push everyone nearby away. A panic button and a setup tool.', cooldown: 7.2, key: 'F' },
-  { id: 'magnet', name: 'Magnet', blurb: 'Pull nearby balls in. They arrive with their speed intact.', cooldown: 8.2, key: 'F' },
+  { id: 'magnet', name: 'Magnet', blurb: 'Pull nearby balls in. They arrive with their speed intact.', cooldown: 7.6, key: 'F' },
   { id: 'phase', name: 'Phase', blurb: 'Slip through other balls. Hazards and the edge still exist.', cooldown: 8, key: 'F' },
   { id: 'overdrive', name: 'Overdrive', blurb: 'Raise your speed cap and pickup. Control gets worse.', cooldown: 9, key: 'F' },
-  { id: 'anchor', name: 'Anchor', blurb: 'Become a wall. Hits bounce off you, and you barely move.', cooldown: 8.4, key: 'F' },
+  { id: 'anchor', name: 'Anchor', blurb: 'Become a wall. Hits bounce off you, and you barely move.', cooldown: 9, key: 'F' },
   { id: 'repulse', name: 'Repulse', blurb: 'A directional blast along your steer. Aim it.', cooldown: 7.2, key: 'F' },
   { id: 'blink', name: 'Blink', blurb: 'Teleport a short distance along your steer, staying on the floor.', cooldown: 6.6, key: 'F' },
-  { id: 'gravity-well', name: 'Gravity Well', blurb: 'Drop a well that drags other balls. You are not pulled.', cooldown: 9.2, key: 'F' },
-  { id: 'mirror', name: 'Mirror', blurb: 'The next solid hit rebounds onto the attacker.', cooldown: 8.6, key: 'F' },
+  { id: 'gravity-well', name: 'Gravity Well', blurb: 'Drop a well that drags other balls. You are not pulled.', cooldown: 8.6, key: 'F' },
+  { id: 'mirror', name: 'Mirror', blurb: 'The next solid hit rebounds onto the attacker.', cooldown: 9.4, key: 'F' },
   { id: 'split', name: 'Split', blurb: 'Throw a decoy with your momentum. It hits once, then pops.', cooldown: 8, key: 'F' },
 ]
 

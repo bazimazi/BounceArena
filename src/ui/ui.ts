@@ -1071,10 +1071,14 @@ export class Shell {
     const menu = button('', 'btn ghost', () => this.onMenu())
     menu.append(icon('home'), document.createTextNode('Menu'))
     actions.append(rematch, hl, menu)
-    side.append(actions)
+    // Phones dock the actions to the bottom of the screen, outside the scrolling panels.
+    const dock = window.matchMedia('(max-width: 760px)').matches
+    if (dock) actions.classList.add('dock')
+    else side.append(actions)
 
     wrap.append(hero, side)
     this.root.append(wrap)
+    if (dock) this.root.append(actions)
     this.stagger(hero, 90)
     this.stagger(side, 55)
   }
@@ -1217,11 +1221,27 @@ export class Shell {
         }
         r.intro.append(muts)
       }
+      // The lineup: every ball in the match, yours first, sliding in one after another.
+      const lineup = el('div', 'lineup')
+      const order = [...match.players].sort((a, b) => Number(b.id === youId) - Number(a.id === youId) || (match.config.teams ? a.team - b.team : 0))
+      order.forEach((p, i) => {
+        const card = el('div', `lu${p.id === youId ? ' you' : ''}`)
+        card.style.setProperty('--c', match.config.teams ? TEAM_COLORS[p.team % TEAM_COLORS.length]! : p.color)
+        card.style.setProperty('--d', `${120 + i * 70}ms`)
+        const av = document.createElement('canvas')
+        ballAvatar(av, p.color, p.skin, p.pattern, p.id === youId ? 'focus' : 'idle', 38)
+        const meta = el('span', 'lu-meta')
+        meta.append(el('b', '', p.name), el('small', '', p.bot ? botTag(p.botLevel) : p.id === youId ? 'YOU' : 'PLAYER'))
+        card.append(av, meta)
+        lineup.append(card)
+      })
+      r.intro.append(lineup)
     }
     r.intro.hidden = !counting
+    this.hud.classList.toggle('counting', counting)
 
     // Clock and phase.
-    const phase = match.status === 'sudden' ? 'SUDDEN DEATH' : match.finalPhase ? 'FINAL PHASE' : match.status === 'countdown' ? 'GET READY' : ''
+    const phase = match.status === 'sudden' ? 'SUDDEN DEATH' : match.finalPhase ? 'FINAL PHASE' : ''
     if (r.phase.textContent !== phase) r.phase.textContent = phase
     r.phase.hidden = !phase
     r.phase.classList.toggle('danger', match.status === 'sudden' || match.finalPhase)
@@ -1259,10 +1279,15 @@ export class Shell {
     for (const child of [...r.feed.children]) if (!live.has(child as HTMLElement)) child.remove()
 
     // Banner: slam in when the sim announces something new.
+    // Someone else's last stock in a crowd is a small callout, not a banner over the action.
+    const minor = !!match.banner && match.banner.text === 'LAST STOCK' && match.banner.sub !== you.name && match.players.length > 2
     if (match.banner !== this.lastBanner) {
       this.lastBanner = match.banner
       r.banner.replaceChildren()
-      if (match.banner && match.banner.text !== 'GO') {
+      if (minor && match.banner) {
+        r.callout.textContent = `${match.banner.sub.toUpperCase()} · LAST STOCK`
+        restart(r.callout, 'show')
+      } else if (match.banner && match.banner.text !== 'GO') {
         const danger = /SUDDEN|FINAL|LAST|METEOR|HOLE|BLAST/.test(match.banner.text)
         r.banner.classList.toggle('danger', danger)
         r.banner.classList.toggle('win', /WINS/.test(match.banner.text))
@@ -1271,6 +1296,8 @@ export class Shell {
         restart(r.banner, 'slam')
       }
     }
+    // While a banner is up, the tip steps aside so the two never stack.
+    this.hud.classList.toggle('bannering', !!match.banner && match.banner.text !== 'GO' && !minor)
 
     // "N LEFT" callout as contenders drop.
     const left = match.players.filter((p) => !p.eliminated).length
@@ -1304,7 +1331,9 @@ export class Shell {
     r.hint.hidden = !hint || out
     if (r.hint.textContent !== hint) r.hint.textContent = hint
     if (out && !r.spectate.childElementCount) {
-      r.spectate.append(el('strong', '', `ELIMINATED · ${placeLabel(you.placement)}`), el('small', '', 'Spectating · Esc for results'))
+      const ff = el('span', 'ff')
+      ff.append(icon('next'), icon('next'), document.createTextNode('FAST-FORWARD'))
+      r.spectate.append(el('strong', '', `ELIMINATED · ${placeLabel(you.placement)}`), ff, el('small', '', 'Watching the finish · RESULTS to skip'))
     }
 
     // Speed and cooldowns.
@@ -1892,3 +1921,8 @@ function slider(label: string, value: number, onChange: (v: number) => void, for
   return wrap
 }
 
+
+/** Short skill tag for a bot in the lineup. */
+function botTag(level: string): string {
+  return level === 'champion' ? 'CHAMPION' : level === 'ace' ? 'ACE' : level === 'rival' ? 'RIVAL' : 'ROOKIE'
+}

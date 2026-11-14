@@ -77,6 +77,15 @@ export interface Body {
   emoteText: string
   emoteTime: number
   hitFlash: number
+  /** Launch stun: no steering, dash, or ability until it runs out. Presses during it are buffered. */
+  stun: number
+  stunMax: number
+  /** Presentation flag for a dash that pulled the ball back from a fall. */
+  recovered: number
+  /** Seconds of teeter left while hanging over the edge after an unforced overshoot. */
+  teeter: number
+  /** The once-per-airtime recovery dash is still available. Refills on landing. */
+  airDash: boolean
   hazardTime: number
   portalCd: number
 
@@ -133,6 +142,12 @@ export interface Body {
   soft: boolean
   /** Seconds a bot has been in edge panic. Its save dash waits for a human reaction time. */
   botPanic: number
+  /** Seconds a bot has been in the edge warning zone. It only reacts after a reaction time. */
+  botEdge: number
+  /** This edge scare is one the bot misread, so it reacts late. */
+  botMiss: boolean
+  /** Seconds left on a committed leap across a gap. */
+  botLeap: number
 
   decoy: boolean
   ownerId: string
@@ -223,6 +238,11 @@ export function createBody(cfg: PlayerConfig, stocks: number, competitive: boole
     emoteText: '',
     emoteTime: 0,
     hitFlash: 0,
+    stun: 0,
+    stunMax: 0,
+    recovered: 0,
+    teeter: 0,
+    airDash: true,
     hazardTime: 0,
     portalCd: 0,
     falling: false,
@@ -270,6 +290,9 @@ export function createBody(cfg: PlayerConfig, stocks: number, competitive: boole
     botLock: 0,
     soft: pace < 1,
     botPanic: 0,
+    botEdge: 0,
+    botMiss: false,
+    botLeap: 0,
     decoy: false,
     ownerId: '',
     decoyLife: 0,

@@ -21,6 +21,11 @@ export interface BotSense {
   bodies: Body[]
   hazards: HazardDef[]
   events: BotEvent[]
+  /** Whether a point is on the floor, for leaping gaps on multi-platform arenas. */
+  solid?: (x: number, y: number) => boolean
+  gaps?: boolean
+  /** Tutorial: bots spar rather than fight to survive. */
+  training?: boolean
 }
 
 export function thinkBot(body: Body, sense: BotSense): void {
@@ -28,7 +33,9 @@ export function thinkBot(body: Body, sense: BotSense): void {
     body.input = { ...ZERO_INPUT }
     return
   }
-  const emergency = edgeEmergency(body, sense.playTick)
+  body.botLeap = Math.max(0, body.botLeap - DT)
+  // Mid-leap across a gap the bot is committed; it only panics once it is actually falling.
+  const emergency = body.botLeap > 0 && !body.falling ? null : edgeEmergency(body, sense.playTick, !!sense.training)
   if (emergency) {
     body.input = emergency
     body.botDash = emergency.dash
@@ -72,25 +79,31 @@ function repel(body: Body, sense: BotSense): { x: number; y: number } {
   return { x, y }
 }
 
-function edgeEmergency(body: Body, tick: number): InputFrame | null {
+function edgeEmergency(body: Body, tick: number, training = false): InputFrame | null {
   const speed = hypot(body.vx, body.vy)
   // A hot ball plays the edge more carefully: one more hit sends it farther.
   const warn = 64 + speed * 0.28 + Math.min(60, body.heat * 0.3)
   const outward = body.vx * -body.safetyX + body.vy * -body.safetyY
   if (body.edgeDist > warn || outward < 28) {
     body.botPanic = 0
+    body.botEdge = 0
     return null
   }
+  // Saves are not instant. A bot has to notice the edge like a person does: a rookie needs about
+  // 0.2 s before it even starts steering home, a champion about 0.07 s. Some scares are misread
+  // and noticed late, more often the lower the skill. A launched ball cannot act anyway, and
+  // only starts noticing once it has control back.
+  const react = lerp(0.2, 0.07, body.skill)
+  if (body.botEdge === 0) body.botMiss = hash01(tick, body.id, 21) < (1 - body.skill) * 0.2
+  body.botEdge = body.stun > 0 ? Math.min(body.botEdge + DT, react * 0.4) : body.botEdge + DT
+  // The tutorial rival is a sparring partner: it notices the edge late and never saves with a dash.
+  if (body.botEdge < react * (training ? 2.6 : body.botMiss ? 2 : 1)) return null
   const panic = body.edgeDist < 26 + speed * 0.07
   body.botPanic = panic ? body.botPanic + DT : 0
-  const aware = panic || hash01(tick, body.id, 4) < body.skill + 0.25
-  if (!aware) return null
-  // Saves are not instant: a rookie needs about a quarter second to react, a champion a sixteenth.
-  const react = lerp(0.24, 0.06, body.skill)
   return {
     x: body.safetyX,
     y: body.safetyY,
-    dash: panic && body.dashCd <= 0 && body.botPanic >= react,
+    dash: !training && panic && (body.dashCd <= 0 || (body.airDash && body.edgeDist < 0)) && body.botPanic >= react * 0.6,
     ability: false,
     brake: !panic && outward > 240,
     emote: false,
@@ -191,9 +204,24 @@ function decide(body: Body, sense: BotSense): void {
     speed > 260 &&
     dist < 210 &&
     (target.edgeDist < 170 || dist < 120) &&
-    hash01(sense.playTick, body.id, 5) < body.aggression * 0.55 + body.skill * 0.45
+    hash01(sense.playTick, body.id, 5) < body.aggression * 0.55 + body.skill * 0.45 &&
+    // Do not commit a dash into a wall or a mirror, unless too green to notice.
+    !((target.anchorTime > 0 || target.mirrorTime > 0) && hash01(sense.playTick, body.id, 24) < 0.35 + body.skill * 0.6)
   ) {
     body.botDash = true
+  }
+
+  // On split floors a target across the void is reached with a committed dash, like a person would.
+  if (sense.gaps && sense.solid && reacted && body.dashCd <= 0 && align > 0.8 && speed > 220 && dist > 120 && dist < 330) {
+    let gap = false
+    for (let k = 1; k <= 4; k++) {
+      const u = k / 5
+      if (!sense.solid(body.x + dx * u, body.y + dy * u)) gap = true
+    }
+    if (gap && sense.solid(target.x, target.y) && hash01(sense.playTick, body.id, 23) < 0.25 + body.aggression * 0.4) {
+      body.botDash = true
+      body.botLeap = 0.55
+    }
   }
 
   if (speed > 460 && align < 0.1 && body.edgeDist < 220) body.botBrake = true
@@ -225,7 +253,9 @@ function pickTarget(body: Body, pool: Body[], everyone: Body[], time: number): B
     if (f.id === body.botTarget) score += 0.35
     if (body.soft && !f.bot && time < 12) score -= 2.6
     if (f.invuln > 0) score -= 1.6
-    if (f.anchorTime > 0) score -= 1.2
+    // A wall or a mirror is visible; a sharp player picks someone else for the moment.
+    if (f.anchorTime > 0) score -= 1.2 + body.skill * 1.2
+    if (f.mirrorTime > 0) score -= 0.6 + body.skill * 1.6
     score *= 0.55 + body.aggression
     if (score > bestScore) {
       bestScore = score

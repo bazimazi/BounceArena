@@ -34,6 +34,12 @@ export function heatMul(heat: number): number {
   return 1 + (Math.max(0, heat) / 100) * TUNE.heatScale
 }
 
+/** Seconds of launch stun from a push of heat-scaled power `raw` (not capped by the speed cap). */
+export function stunFor(raw: number): number {
+  if (raw <= TUNE.stunFloor) return 0
+  return clamp((raw - TUNE.stunFloor) * TUNE.stunPer + 0.06, 0, TUNE.stunMax)
+}
+
 export interface ImpactOutcome {
   kind: 'none' | 'phase' | 'separate' | 'trade' | 'strike' | 'anchor' | 'mirror' | 'pop'
   attacker: -1 | 0 | 1
@@ -41,6 +47,8 @@ export interface ImpactOutcome {
   power: number
   /** The hit's own power before the victim's heat, for stats, numbers, and heat gain. */
   base?: number
+  /** Heat-scaled power before the speed cap. Drives launch stun. */
+  raw?: number
   popA: boolean
   popB: boolean
 }
@@ -144,7 +152,7 @@ function threat(b: ImpactBody): number {
   const speed = hypot(b.vx, b.vy)
   const dash = b.dashTime > 0 ? 1.38 : 1
   const over = b.overdriveTime > 0 ? 1.12 : 1
-  return speed * b.mass * dash * over * b.outgoing * (0.85 + 0.3 * b.momentum)
+  return speed * Math.sqrt(b.mass) * dash * over * b.outgoing * (0.85 + 0.3 * b.momentum)
 }
 
 function strike(
@@ -165,16 +173,19 @@ function strike(
   const bl = hypot(bx, by) || 1
   const kx = bx / bl
   const ky = by / bl
-  const massAdv = clamp(striker.mass / Math.max(0.25, victim.mass), 0.55, 1.5)
+  // Mass helps, but softly: it already decides who strikes, so it must not also multiply the launch hard.
+  const massAdv = clamp(Math.sqrt(striker.mass / Math.max(0.25, victim.mass)), 0.75, 1.3)
   let power = sp * (0.62 + 0.5 * angle) * massAdv * outgoing * victim.incoming
   power *= 0.9 + 0.22 * striker.momentum
   if (striker.dashTime > 0) power *= TUNE.dashStrikeMul
   if (striker.overdriveTime > 0) power *= 1.1
+  power *= TUNE.launchScale
   const base = clamp(power, 0, SPEED_CAP)
 
   if (victim.mirrorTime > 0 && !victim.decoy) {
     // The reflection lands on the striker, so it is the striker's heat that scales it.
-    power = clamp(base * heatMul(striker.heat), 0, SPEED_CAP)
+    const raw = base * heatMul(striker.heat)
+    power = clamp(raw, 0, SPEED_CAP)
     victim.mirrorTime = 0
     const keep = 0.15
     striker.vx = striker.vx * keep - kx * power
@@ -188,12 +199,14 @@ function strike(
       attacker: attackerIndex === 0 ? 1 : 0,
       power,
       base,
+      raw,
       popA: attackerIndex === 0 ? popStriker : popVictim,
       popB: attackerIndex === 0 ? popVictim : popStriker,
     }
   }
 
-  power = victim.decoy ? base : clamp(base * heatMul(victim.heat), 0, SPEED_CAP)
+  const raw = victim.decoy ? base : base * heatMul(victim.heat)
+  power = clamp(raw, 0, SPEED_CAP)
 
   // Launch steering: the victim's stick bends the launch a few degrees, like DI.
   let lx = kx
@@ -215,7 +228,7 @@ function strike(
   capSpeed(victim)
   const popA = attackerIndex === 0 ? popStriker : popVictim
   const popB = attackerIndex === 0 ? popVictim : popStriker
-  return { kind: 'strike', attacker: attackerIndex, power, base, popA, popB }
+  return { kind: 'strike', attacker: attackerIndex, power, base, raw, popA, popB }
 }
 
 function bounceOffAnchor(mover: ImpactBody, anchor: ImpactBody, nx: number, ny: number, moverIndex: 0 | 1): ImpactOutcome {

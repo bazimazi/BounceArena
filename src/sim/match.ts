@@ -17,7 +17,7 @@ import { TUNE } from '../data/tuning'
 import { arenaById, mutatorById, type ArenaDef, type HazardDef } from '../data/content'
 import { createBody, seedPhase, type Body } from './body'
 import { resolveCircleWall, supportAt, wallSegments, type Shrink } from './geometry'
-import { resolvePair, capSpeed, heatMul, type ImpactBody } from './impact'
+import { resolvePair, capSpeed, heatMul, stunFor, type ImpactBody } from './impact'
 import { applyMotion, type MotionMods } from './motion'
 import {
   applyEnvironment,
@@ -28,7 +28,7 @@ import {
   laserMode,
   magnetNudge,
 } from './hazards'
-import { castAbility, decayWells, sustainForces, type Well } from './abilities'
+import { castAbility, decayWells, stunBody, sustainForces, type Well } from './abilities'
 import { thinkBot, type BotEvent } from './bot'
 
 export interface Banner {
@@ -97,6 +97,8 @@ export class Match {
     this.mutators = config.mutators ?? []
     this.players = config.players.map((p) => createBody(p, config.stocks, config.competitive, this.mutators))
     this.players.forEach((p, i) => seedPhase(p, config.seed + i * 17))
+    // The tutorial rival flies further, so the lesson (heat, then a launch) lands in under a minute.
+    if (config.modeId === 'tutorial') for (const p of this.players) if (p.bot) p.incoming *= 1.35
     this.bodies = [...this.players]
     this.placeInitial()
     const rng = new Rng(config.seed)
@@ -247,29 +249,34 @@ export class Match {
     b.prevDash = b.input.dash
     b.prevAbility = b.input.ability
     b.prevEmote = b.input.emote
-    // Presses just before a cooldown ends are buffered, so a slightly early input is not lost.
+    // Presses just before a cooldown or a launch stun ends are buffered, so an early input is not
+    // lost. Mashing dash while launched fires the recovery the moment control comes back.
+    const stunned = b.stun > 0
+    const dashWait = Math.max(b.stun, b.dashCd)
     if (dashEdge) {
-      if (b.dashCd > 0 && b.dashCd <= TUNE.inputBuffer) b.dashBuffer = TUNE.inputBuffer
-      else this.doDash(b)
+      if (dashWait > 0 && dashWait <= TUNE.inputBuffer + (stunned ? TUNE.stunMax : 0)) b.dashBuffer = dashWait + TUNE.inputBuffer * 0.5
+      else if (dashWait <= 0) this.doDash(b)
+      else if (!stunned && this.canRecover(b)) this.recover(b)
     } else if (b.dashBuffer > 0) {
       b.dashBuffer = Math.max(0, b.dashBuffer - DT)
-      if (b.dashCd <= 0) {
+      if (b.dashCd <= 0 && !stunned) {
         b.dashBuffer = 0
         this.doDash(b)
       }
     }
     let cast = false
+    const abilityWait = Math.max(b.stun, b.abilityCd)
     if (abilityEdge) {
-      if (b.abilityCd > 0 && b.abilityCd <= TUNE.inputBuffer) b.abilityBuffer = TUNE.inputBuffer
-      else cast = true
+      if (abilityWait > 0 && abilityWait <= TUNE.inputBuffer + (stunned ? TUNE.stunMax : 0)) b.abilityBuffer = abilityWait + TUNE.inputBuffer * 0.5
+      else if (abilityWait <= 0) cast = true
     } else if (b.abilityBuffer > 0) {
       b.abilityBuffer = Math.max(0, b.abilityBuffer - DT)
-      if (b.abilityCd <= 0) {
+      if (b.abilityCd <= 0 && !stunned) {
         b.abilityBuffer = 0
         cast = true
       }
     }
-    if (cast && b.abilityCd <= 0) {
+    if (cast && b.abilityCd <= 0 && !stunned) {
       const hits = castAbility(b, {
         bodies: this.bodies,
         time: this.time,
@@ -290,6 +297,50 @@ export class Match {
       b.emoteTime = 1.6
       b.emoteCd = 3
     }
+  }
+
+  /** Floor within jumping reach along the ball's travel: steering out toward it is a gap jump, not a mistake. */
+  private floorAhead(b: Body): boolean {
+    const sp = hypot(b.vx, b.vy)
+    if (sp < 1) return false
+    for (const reach of [60, 130, 200]) {
+      const x = b.x + (b.vx / sp) * reach
+      const y = b.y + (b.vy / sp) * reach
+      if (supportAt(this.arena.solids, x, y, this.time, this.shrink, DT).edgeDist >= 0) return true
+    }
+    return false
+  }
+
+  /** Over the edge with dash on cooldown, the once-per-airtime recovery is still there. */
+  private canRecover(b: Body): boolean {
+    if (!b.airDash || b.decoy || b.anchorTime > 0) return false
+    if (b.edgeDist >= 0 && !b.falling) return false
+    const depth = b.falling ? b.fallHeight : b.height
+    return depth > TUNE.recoverDepth
+  }
+
+  /** The recovery: a weaker dash home that does not need the cooldown, once until you land. */
+  private recover(b: Body): void {
+    let dx = b.input.x
+    let dy = b.input.y
+    let mag = hypot(dx, dy)
+    if (mag < 0.18 || (dx * b.safetyX + dy * b.safetyY) / mag < 0.2) {
+      dx = b.safetyX
+      dy = b.safetyY
+      mag = hypot(dx, dy) || 1
+    }
+    dx /= mag
+    dy /= mag
+    b.airDash = false
+    b.vx = b.vx * 0.25 + dx * TUNE.recoverSpeed
+    b.vy = b.vy * 0.25 + dy * TUNE.recoverSpeed
+    if (b.falling) b.fallVel = Math.max(b.fallVel, TUNE.recoverHop)
+    b.coyote = Math.max(b.coyote, 0.14)
+    b.dashTime = TUNE.dashWindow * 0.6
+    b.recovered = 0.6
+    b.stats.dashes += 1
+    capSpeed(b)
+    this.pushFx({ type: 'dash', x: b.x, y: b.y, power: TUNE.recoverSpeed, color: b.color, actorId: b.id, victimId: '', text: 'recover' })
   }
 
   private doDash(b: Body): void {
@@ -324,9 +375,20 @@ export class Match {
       b.vy *= TUNE.perfectDashBoost
       b.stats.perfectDashes += 1
     }
+    // A dash back toward the floor while going over the edge pops the ball up: the recovery.
+    let recover = false
+    if ((!b.supported || b.falling || b.edgeDist < -4) && dx * b.safetyX + dy * b.safetyY > 0.35) {
+      const depth = b.falling ? b.fallHeight : b.height
+      if (depth > TUNE.recoverDepth) {
+        recover = true
+        if (b.falling) b.fallVel = Math.max(b.fallVel, TUNE.recoverHop)
+        b.coyote = Math.max(b.coyote, 0.12)
+        b.recovered = 0.6
+      }
+    }
     capSpeed(b, SPEED_CAP)
     b.anchorTime = 0
-    this.pushFx({ type: 'dash', x: b.x, y: b.y, power: dashSpeed, color: b.color, actorId: b.id, victimId: '', text: perfect ? 'perfect' : '' })
+    this.pushFx({ type: 'dash', x: b.x, y: b.y, power: dashSpeed, color: b.color, actorId: b.id, victimId: '', text: perfect ? 'perfect' : recover ? 'recover' : '' })
   }
 
   private substep(dt: number): void {
@@ -342,19 +404,21 @@ export class Match {
       b.mirrorTime = Math.max(0, b.mirrorTime - dt)
       b.magnetTime = Math.max(0, b.magnetTime - dt)
       b.invuln = Math.max(0, b.invuln - dt)
+      b.stun = Math.max(0, b.stun - dt)
       b.secondWind = Math.max(0, b.secondWind - dt)
       b.secondWindCd = Math.max(0, b.secondWindCd - dt)
       b.reactiveCd = Math.max(0, b.reactiveCd - dt)
 
       const mods = this.modsFor(b)
-      mods.braking = b.input.brake && b.anchorTime <= 0
+      const stunned = b.stun > 0
+      mods.braking = b.input.brake && b.anchorTime <= 0 && !stunned
       mods.falling = b.falling
       if (b.secondWind > 0) mods.accelMul *= 1.25
       if (b.dashTime > 0) {
         mods.maxMul = Math.max(mods.maxMul, (TUNE.dashSpeed * b.dashMul * 1.12) / Math.max(1, b.maxSpeed))
       }
       if (b.sinceLand < 0.2) mods.maxMul = Math.max(mods.maxMul, 1.14)
-      if (!b.decoy) applyMotion(b, b.input.x, b.input.y, dt, mods)
+      if (!b.decoy) applyMotion(b, stunned ? 0 : b.input.x, stunned ? 0 : b.input.y, dt, mods)
       b.x += b.vx * dt
       b.y += b.vy * dt
       this.skimRim(b)
@@ -367,7 +431,7 @@ export class Match {
         b.vx = hit.vx
         b.vy = hit.vy
         if (hit.speedIn > 80) {
-          const steer = b.input.x * hit.nx + b.input.y * hit.ny
+          const steer = stunned ? 0 : b.input.x * hit.nx + b.input.y * hit.ny
           if (steer > 0.28) {
             const boost = b.core === 'elastic' ? 1.1 : 1.055
             b.vx *= boost
@@ -396,10 +460,37 @@ export class Match {
     }
   }
 
-  /** Slow outward drift skates the lip. A dash or a fresh hit punches through. */
+  /**
+   * Slow outward drift skates the lip. A dash or a fresh hit punches through, and then the ball
+   * teeters over the edge (unless launched) where holding home claws it back.
+   */
   private skimRim(b: Body): void {
-    if (!b.alive || b.decoy || !b.supported || b.falling || b.dashTime > 0) return
-    if (b.lastHitTime > 0 && this.time - b.lastHitTime < 0.75) return
+    if (!b.alive || b.decoy || !b.supported || b.falling || b.stun > 0) return
+    if (b.teeter > 0 && b.edgeDist < 0) {
+      // Hanging over the edge: outward speed bleeds off, so a quick save can still land.
+      const ox = -b.safetyX
+      const oy = -b.safetyY
+      const outward = b.vx * ox + b.vy * oy
+      const h = DT / TUNE.substeps
+      // Holding toward the floor claws back: outward speed dies fast and the ball is pulled home.
+      // A dash, or steering away from the floor on purpose (a gap jump), keeps its momentum.
+      const home = b.input.x * b.safetyX + b.input.y * b.safetyY
+      if (b.dashTime > 0) return
+      if (home < -0.5 && this.floorAhead(b)) return
+      const claw = home > 0.2
+      if (outward > 0) {
+        const cut = outward * (1 - Math.exp(-(claw ? TUNE.teeterDrag * 2.2 : TUNE.teeterDrag) * h))
+        b.vx -= ox * cut
+        b.vy -= oy * cut
+      }
+      if (claw) {
+        b.vx += b.safetyX * TUNE.clawAccel * home * h
+        b.vy += b.safetyY * TUNE.clawAccel * home * h
+      }
+      return
+    }
+    if (b.dashTime > 0) return
+    if (b.lastHitTime > 0 && this.time - b.lastHitTime < TUNE.rimGrace) return
     const lip = 52
     if (b.edgeDist >= lip || b.edgeDist < 0) return
     const ox = -b.safetyX
@@ -430,7 +521,7 @@ export class Match {
     const victim = outcome.attacker === 0 ? b : outcome.attacker === 1 ? a : null
     // Stats, numbers, and heat use the hit's own power; the victim's heat label shows how far it went.
     const shown = outcome.base ?? outcome.power
-    if (attacker && victim && outcome.power > 30) this.noteHit(attacker, victim, shown, outcome.kind)
+    if (attacker && victim && outcome.power > 30) this.noteHit(attacker, victim, shown, outcome.kind, outcome.raw ?? 0)
     if (outcome.popA && a.decoy) a.remove = true
     if (outcome.popB && b.decoy) b.remove = true
     if (outcome.power > 120) {
@@ -447,9 +538,16 @@ export class Match {
     }
   }
 
-  private noteHit(attacker: Body, victim: Body, power: number, kind: string): void {
+  private noteHit(attacker: Body, victim: Body, power: number, kind: string, raw: number): void {
     const owner = attacker.decoy ? this.players.find((p) => p.id === attacker.ownerId) ?? attacker : attacker
     if (victim.decoy || victim.invuln > 0) return
+    if (kind === 'strike' || kind === 'mirror') {
+      stunBody(victim, stunFor(raw))
+      // A launch strong enough to take control away gets its own moment on screen and in audio.
+      if (victim.stun >= 0.16 && victim.stunMax === victim.stun) {
+        this.pushFx({ type: 'launch', x: victim.x, y: victim.y, power: victim.stun, color: owner.color, actorId: owner.id, victimId: victim.id, text: '' })
+      }
+    }
     victim.hitFlash = 1
     attacker.hitFlash = Math.max(attacker.hitFlash, 0.6)
     victim.lastAttacker = owner.id
@@ -533,6 +631,10 @@ export class Match {
       const on = sup.edgeDist >= -8
       if (on) {
         b.coyote = b.passive === 'glider' ? TUNE.coyote + 0.05 : TUNE.coyote
+        // Back on the floor after hanging over the edge: a save worth showing.
+        if (b.teeter > 0 && !b.decoy) this.pushFx({ type: 'save', x: b.x, y: b.y, power: 0.5, color: b.color, actorId: b.id, victimId: '', text: 'edge' })
+        b.teeter = 0
+        b.airDash = true
         b.supported = true
         if (sup.pose?.def.orbit) {
           b.x += sup.carryX
@@ -541,6 +643,13 @@ export class Match {
           b.inheritVy = sup.carryY / DT
         }
       } else if (b.coyote > 0) {
+        // Any ball that goes over without launch stun teeters on the brink for a moment. A stunned
+        // (truly launched) ball does not: that knockout belongs to the hitter.
+        if (b.teeter === 0 && !b.falling && !b.decoy && b.stun <= 0) {
+          b.coyote += TUNE.teeter
+          b.teeter = b.coyote
+          this.pushFx({ type: 'teeter', x: b.x, y: b.y, power: b.coyote, color: b.color, actorId: b.id, victimId: '', text: '' })
+        } else if (b.teeter === 0) b.teeter = -1
         b.coyote -= DT
         b.supported = b.coyote > 0
       } else {
@@ -556,6 +665,7 @@ export class Match {
     b.emoteTime = Math.max(0, b.emoteTime - dt)
     b.hitFlash = Math.max(0, b.hitFlash - dt * 4)
     b.perfectFlash = Math.max(0, b.perfectFlash - dt)
+    b.recovered = Math.max(0, b.recovered - dt)
     if (b.alive && !b.decoy && !b.falling) {
       b.stats.survival += dt
       b.stats.lifeTime += dt
@@ -587,7 +697,7 @@ export class Match {
         b.grounded = true
         b.sinceLand = 0
         const inputMag = hypot(b.input.x, b.input.y)
-        if (inputMag > 0.2 && b.anchorTime <= 0) {
+        if (inputMag > 0.2 && b.anchorTime <= 0 && b.stun <= 0) {
           const burst = TUNE.landingBurst * b.landMul * (mods.rubber || b.surface === 'rubber' ? 1.12 : 1)
           b.vx += (b.input.x / inputMag) * burst
           b.vy += (b.input.y / inputMag) * burst
@@ -701,6 +811,7 @@ export class Match {
           b.hitFlash = 1
           b.lastHitHazard = true
           b.lastHitTime = this.time
+          stunBody(b, stunFor(kick) * 0.8)
         }
       } else if (ev.kind === 'hole' && this.time >= ev.born + ev.dur) {
         ev.fired = true
@@ -804,6 +915,10 @@ export class Match {
   }
 
   private rules(dt: number): void {
+    // Tutorial safety net: a rival that has lasted a while tires, so every learner gets the knockout.
+    if (this.config.modeId === 'tutorial' && this.time > 25) {
+      for (const p of this.players) if (p.bot && p.alive) this.addHeat(p, 1.6 * dt)
+    }
     if (!this.markedMid && this.config.duration > 0 && this.time >= this.config.duration * 0.5) {
       this.markedMid = true
       const maxStocks = Math.max(...this.players.map((p) => p.stocks))
@@ -880,6 +995,7 @@ export class Match {
     b.falling = false
     b.vx = 0
     b.vy = 0
+    b.stun = 0
     b.stats.deaths += 1
     b.stats.longestLife = Math.max(b.stats.longestLife, b.stats.lifeTime)
     b.stats.lifeTime = 0
@@ -964,6 +1080,9 @@ export class Match {
     b.deepFall = false
     b.invuln = TUNE.spawnInvuln
     b.heat = 0
+    b.stun = 0
+    b.dashBuffer = 0
+    b.abilityBuffer = 0
     b.supported = true
     b.dashTime = 0
     this.pushFx({ type: 'spawn', x: b.x, y: b.y, power: 1, color: b.color, actorId: b.id, victimId: '', text: '' })
@@ -1048,9 +1167,12 @@ export class Match {
       time: this.time,
       playTick: this.playTick,
       teams: this.config.teams,
+      training: this.config.modeId === 'tutorial',
       zone: this.zone,
       bodies: this.bodies,
       hazards: this.allHazards(),
+      solid: (x: number, y: number) => supportAt(this.arena.solids, x, y, this.time, this.shrink, DT).edgeDist >= 0,
+      gaps: this.arena.solids.length > 1,
       events,
     }
   }

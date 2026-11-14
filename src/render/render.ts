@@ -39,7 +39,7 @@ export function heatColor(heat: number): string {
 
 type Kind =
   | 'spark' | 'chunk' | 'puff' | 'ring' | 'implode' | 'sring' | 'flash' | 'text' | 'stamp' | 'confetti'
-  | 'beam' | 'pillar' | 'ember' | 'smoke' | 'star' | 'shard' | 'bolt' | 'scorch' | 'faller' | 'streak' | 'zzz'
+  | 'beam' | 'pillar' | 'ember' | 'smoke' | 'star' | 'shard' | 'bolt' | 'scorch' | 'faller' | 'streak' | 'zzz' | 'burst' | 'edgeflare'
 
 interface Particle {
   kind: Kind
@@ -90,6 +90,9 @@ interface BallFx {
   lastY: number
   seed: number
   perfect: number
+  /** Launch streak strength, set by a stun launch and fading out. */
+  launch: number
+  launchAng: number
 }
 
 interface Mote {
@@ -158,6 +161,8 @@ export class Renderer {
   private css: (x: number, y: number, z?: number) => { x: number; y: number } = (x, y) => ({ x, y })
   width = 1
   height = 1
+  /** CSS pixels the match HUD covers at the top; the camera frames the arena below it. */
+  insetTop = 0
 
   constructor(private canvas: HTMLCanvasElement) {
     const ctx = canvas.getContext('2d')
@@ -272,6 +277,19 @@ export class Renderer {
         this.ring(e.x, e.y, e.color, 26, 0.26, 3)
         this.add({ kind: 'flash', x: e.x, y: e.y, z: 16, size: 26, color: e.color, life: 0.1 })
       } else if (e.type === 'ability') this.onAbility(e, match, local, full)
+      else if (e.type === 'launch') this.onLaunch(e, match, localId, full, prefs, motion, shake)
+      else if (e.type === 'teeter') {
+        const b = match.bodies.find((x) => x.id === e.actorId)
+        for (let i = 0; i < (full ? 4 : 2); i++) {
+          const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.6
+          this.add({ kind: 'spark', x: e.x, y: e.y, z: (b?.radius ?? 20) * 2, vx: Math.cos(a) * 60, vy: 0, vz: 160 + Math.random() * 120, g: 700, size: 2.4, color: '#9fe6ff', life: 0.5, drag: 1 })
+        }
+        if (b) {
+          const fx = this.fxFor(b)
+          fx.squashAng = 0
+          fx.squashV += 6
+        }
+      }
       else if (e.type === 'pickup') {
         this.ring(e.x, e.y, e.color, 60, 0.5, 5)
         this.add({ kind: 'sring', x: e.x, y: e.y, z: 24, size: 50, color: '#ffffff', life: 0.35, spin: 3 })
@@ -280,6 +298,14 @@ export class Renderer {
           this.add({ kind: 'star', x: e.x, y: e.y, z: 24, vx: Math.cos(a) * 200, vy: Math.sin(a) * 200, vz: 120, g: 300, size: 7, color: e.color, life: 0.65, drag: 3 })
         }
         if (e.text) this.add({ kind: 'text', x: e.x, y: e.y, z: 70, vz: 60, size: 20, color: e.color, life: 1, drag: 2, text: e.text })
+      } else if (e.type === 'save' && e.text === 'edge') {
+        // Clawed back from the brink: dust kicks off the lip and a quick mint ring.
+        this.ring(e.x, e.y, '#3ee6a0', 44, 0.4, 4)
+        for (let i = 0; i < (full ? 7 : 3); i++) {
+          const a = Math.random() * TAU
+          this.add({ kind: 'puff', x: e.x, y: e.y, z: 3, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90, size: 6 + Math.random() * 4, color: '#dfe9f5', life: 0.4, drag: 4 })
+        }
+        if (local) this.add({ kind: 'text', x: e.x, y: e.y, z: 64, vz: 70, size: 19, color: '#3ee6a0', life: 0.9, drag: 2, text: 'SAVED!' })
       } else if (e.type === 'save') {
         this.ring(e.x, e.y, '#3ee6a0', 60, 0.5, 5)
         for (let i = 0; i < 10; i++) {
@@ -386,9 +412,45 @@ export class Renderer {
           this.add({ kind: 'star', x: e.x, y: e.y, z: 22, vx: Math.cos(q) * 170, vy: Math.sin(q) * 170, vz: 80, g: 200, size: 5, color: '#ffc14d', life: 0.45, drag: 3 })
         }
         if (local) this.add({ kind: 'text', x: e.x, y: e.y, z: 64, vz: 80, size: 19, color: '#ffc14d', life: 0.85, drag: 2.5, text: 'PERFECT' })
+      } else if (e.text === 'recover') {
+        // A dash that pulls the ball back from a fall: a hop ring and a burst of mint stars.
+        fx.squashAng = Math.PI / 2
+        fx.squashV -= 7
+        this.ring(e.x, e.y, '#3ee6a0', 58, 0.45, 5)
+        this.add({ kind: 'sring', x: e.x, y: e.y, z: 18, size: 36, color: '#b8ffe0', life: 0.3, spin: 3 })
+        for (let i = 0; i < 8; i++) {
+          const q = (i / 8) * TAU
+          this.add({ kind: 'star', x: e.x, y: e.y, z: 18, vx: Math.cos(q) * 150, vy: Math.sin(q) * 150, vz: 140, g: 300, size: 5, color: '#3ee6a0', life: 0.5, drag: 3 })
+        }
+        if (local) this.add({ kind: 'text', x: e.x, y: e.y, z: 64, vz: 80, size: 20, color: '#3ee6a0', life: 0.9, drag: 2.5, text: 'RECOVER!' })
       }
     }
     if (local) this.trauma = Math.min(1, this.trauma + 0.06 * shake)
+  }
+
+  /** A hit strong enough to take control away: anime speed burst, a launch streak, a camera kick. */
+  private onLaunch(e: FxEvent, match: Match, localId: string, full: boolean, prefs: RenderPrefs, motion: number, shake: number): void {
+    const victim = match.bodies.find((b) => b.id === e.victimId)
+    if (!victim) return
+    const k = clamp(e.power / 0.45, 0, 1)
+    const ang = Math.atan2(victim.vy, victim.vx)
+    const fx = this.fxFor(victim)
+    fx.launch = 0.35 + k * 0.5
+    fx.launchAng = ang
+    if (full) this.add({ kind: 'burst', x: e.x, y: e.y, z: victim.radius, size: 70 + k * 90, color: e.color, life: 0.22 + k * 0.12, rot: ang })
+    this.ring(e.x, e.y, '#ffffff', 40 + k * 50, 0.3, 4 + k * 4)
+    for (let i = 0; i < (full ? 10 : 4); i++) {
+      const a = ang + Math.PI + (Math.random() - 0.5) * 1.2
+      const s = 120 + Math.random() * 260
+      this.add({ kind: 'smoke', x: e.x, y: e.y, z: victim.radius, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: 40, size: 8 + Math.random() * 8, color: '#c9d3e6', life: 0.5 + Math.random() * 0.3, drag: 4 })
+    }
+    const mine = e.victimId === localId || e.actorId === localId
+    if (mine) {
+      this.trauma = Math.min(1, this.trauma + (0.12 + k * 0.25) * shake)
+      this.punch = Math.max(this.punch, (0.03 + k * 0.05) * motion)
+    }
+    // The heaviest launches get a beat of extra freeze so they land.
+    if (k > 0.55 && !prefs.reducedMotion) this.hitstop = Math.max(this.hitstop, 0.06 + k * 0.05)
   }
 
   private onElim(e: FxEvent, match: Match, localId: string, local: boolean, full: boolean, prefs: RenderPrefs, motion: number, shake: number): void {
@@ -413,6 +475,8 @@ export class Renderer {
       })
     }
     if (!prefs.reducedMotion) this.add({ kind: 'beam', x: e.x, y: e.y, z: 0, size: 1, color, life: 0.9, rot: ang })
+    // The blast at the screen edge where the ball left, so a knockout lands even off-camera.
+    if (!hazard && full && !prefs.reducedMotion && prefs.flashes !== false) this.add({ kind: 'edgeflare', x: e.x, y: e.y, z: 10, size: local ? 1.15 : 0.65, color, life: local ? 0.75 : 0.55, rot: ang })
     this.ring(e.x, e.y, '#ffffff', 90, 0.5, 6)
     this.ring(e.x, e.y, color, 150, 0.8, 10)
     this.add({ kind: 'sring', x: e.x, y: e.y, z: 10, size: 120, color, life: 0.5, spin: 8 })
@@ -469,7 +533,7 @@ export class Renderer {
         this.add({ kind: 'puff', x: e.x, y: e.y, z: 3, vx: Math.cos(a) * 380, vy: Math.sin(a) * 380, size: 8, color: '#e6eef8', life: 0.45, drag: 5 })
       }
     } else if (id === 'magnet' || id === 'gravity-well') {
-      const R = id === 'magnet' ? 210 : 150
+      const R = id === 'magnet' ? 210 : 165
       this.add({ kind: 'implode', x: e.x, y: e.y, z: 0, size: R, color: id === 'magnet' ? c : '#b388ff', life: 0.5, spin: 4 })
       for (let i = 0; i < (full ? 18 : 6); i++) {
         const a = Math.random() * TAU
@@ -625,7 +689,10 @@ export class Renderer {
     }
     const you = front.find((b) => b.id === spectateId)
     if (you && !menu && match.status !== 'countdown') this.localMarker(you, project)
-    for (const b of front) this.trail(b, project)
+    for (const b of front) {
+      this.trail(b, project)
+      this.launchStreak(b, project)
+    }
 
     // Upright things, painted back to front.
     const items: DrawItem[] = []
@@ -641,26 +708,36 @@ export class Renderer {
 
     this.drawParticles(project, 0, prefs, 'air')
 
-    // Labels stack upward when they would overlap, using their real widths.
+    // Labels never pile up. Your own is always full. Others get the full name pill when it fits,
+    // drop to a compact heat chip in a crowd, and vanish rather than stack more than one row.
     this.labelScale = clamp(Math.min(w, h) / this.dpr / 760, 0.82, 1.08)
     const placed: { x: number; y: number; w: number }[] = []
     const rowH = 24 * this.dpr * this.labelScale
-    const sorted = [...front].sort((a, b) => a.y - b.y)
+    const gap = 4 * this.dpr
+    const fits = (x: number, y: number, lw: number) => !placed.some((o) => Math.abs(o.x - x) < (o.w + lw) / 2 + gap && Math.abs(o.y - y) < rowH)
     if (match.status !== 'countdown' || !this.anyDropping()) {
-      for (const b of sorted) {
-        if (b.decoy) continue
-        const fx = this.fxFor(b)
-        if (fx.drop > 0.05) continue
+      const order = [...front]
+        .filter((b) => !b.decoy && this.fxFor(b).drop <= 0.05)
+        // Local first, then the hottest balls: their numbers matter most.
+        .sort((a, b) => Number(b.id === spectateId) - Number(a.id === spectateId) || b.heat - a.heat)
+      for (const b of order) {
+        const local = b.id === spectateId && !menu
         const p = project(b.x, b.y, this.zOf(b) + b.radius * 2 + 10)
-        const lw = this.labelWidth(b)
-        let y = p.y
-        for (let guard = 0; guard < 6; guard++) {
-          const hit = placed.some((o) => Math.abs(o.x - p.x) < (o.w + lw) / 2 + 4 * this.dpr && Math.abs(o.y - y) < rowH)
-          if (!hit) break
-          y -= rowH
+        const team = match.config.teams ? teamColor(b.team) : ''
+        const full = this.labelWidth(b, false)
+        if (local || fits(p.x, p.y, full)) {
+          placed.push({ x: p.x, y: p.y, w: full })
+          this.label(b, p.x, p.y, local, team, false)
+          continue
         }
-        placed.push({ x: p.x, y, w: lw })
-        this.label(b, p.x, y, b.id === spectateId && !menu, match.config.teams ? teamColor(b.team) : '')
+        if (b.heat < 1) continue
+        const lite = this.labelWidth(b, true)
+        for (const y of [p.y, p.y - rowH]) {
+          if (!fits(p.x, y, lite)) continue
+          placed.push({ x: p.x, y, w: lite })
+          this.label(b, p.x, y, false, team, true)
+          break
+        }
       }
     }
 
@@ -736,8 +813,9 @@ export class Renderer {
     // Portrait phones would fit the arena to the narrow side and waste most of the screen.
     // Zoom in and let the camera follow the local ball further instead.
     const tall = clamp((h / Math.max(1, w) - 1.05) / 0.9, 0, 1)
+    const inset = menu ? 0 : this.insetTop * dpr
     const fitW = w / (2 * view * 1.02)
-    const fitH = h / ((2 * view * TILT + DEPTH * 1.2) * 1.02)
+    const fitH = (h - inset) / ((2 * view * TILT + DEPTH * 1.2) * 1.02)
     const base = Math.min(fitW, fitH) * (1 + tall * 0.5) * (menu ? 0.94 : 1)
 
     let tx = 0
@@ -760,7 +838,7 @@ export class Renderer {
       const pad = 250
       const halfW = (maxX - minX) / 2 + pad
       const halfH = ((maxY - minY) / 2 + pad) * TILT + 60
-      const fit = Math.min(w / 2 / (halfW * base), h / 2 / (halfH * base))
+      const fit = Math.min(w / 2 / (halfW * base), (h - inset) / 2 / (halfH * base))
       zoomK = clamp(fit, 1, alive.length <= 2 ? 1.35 : 1.15)
       const k = clamp((zoomK - 1) / 0.3, 0, 1) * 0.85
       tx = lerp(0, (minX + maxX) / 2, k)
@@ -805,7 +883,7 @@ export class Renderer {
 
     this.Z = Z
     this.OX = w / 2 + biasX * dpr + sx + this.kickX * dpr
-    this.OY = h / 2 - tall * h * 0.05 - DEPTH * Z * 0.45 + sy + this.kickY * dpr
+    this.OY = h / 2 + inset * 0.5 - tall * h * 0.05 - DEPTH * Z * 0.45 + sy + this.kickY * dpr
   }
 
   // ================================================================ background
@@ -2014,7 +2092,7 @@ export class Renderer {
         squash: 0, squashV: 0, squashAng: 0, land: 0,
         lookX: 0, lookY: 0.2, hurt: 0, focus: 0, idle: 0,
         ghosts: [], ghostTimer: 0, emberTimer: 0, smokeTimer: 0, zzzTimer: 0,
-        drop: 0, dropDelay: 0, lastX: b.x, lastY: b.y, seed: seed / 997, perfect: 0,
+        drop: 0, dropDelay: 0, lastX: b.x, lastY: b.y, seed: seed / 997, perfect: 0, launch: 0, launchAng: 0,
       }
       this.balls.set(b.id, fx)
     }
@@ -2037,6 +2115,8 @@ export class Renderer {
     fx.hurt = Math.max(0, fx.hurt - dt)
     fx.focus = Math.max(0, fx.focus - dt)
     fx.perfect = Math.max(0, fx.perfect - dt)
+    fx.launch = b.stun > 0 ? Math.max(fx.launch, 0.2) : Math.max(0, fx.launch - dt * 2.2)
+    if (fx.launch > 0 && Math.hypot(b.vx, b.vy) > 60) fx.launchAng = Math.atan2(b.vy, b.vx)
     if (fx.dropDelay > 0) fx.dropDelay -= dt
     else if (fx.drop > 0) {
       fx.drop = Math.max(0, fx.drop - dt / 0.42)
@@ -2101,6 +2181,7 @@ export class Renderer {
       if (match.winnerIds.includes(b.id)) return 'happy'
     }
     if (b.emoteTime > 0) return 'happy'
+    if (b.stun > 0.03) return 'dizzy'
     if (fx.hurt > 0 || b.hitFlash > 0.55) return 'hurt'
     if (fx.drop > 0.02) return 'scared'
     const outward = b.vx * -b.safetyX + b.vy * -b.safetyY
@@ -2250,6 +2331,7 @@ export class Renderer {
     const r = (b.radius + 9) * this.Z
     const ry = r * TILT
     const dpr = this.dpr
+    if (b.teeter > 0 && b.edgeDist < 0) this.homeArrow(b, project)
     ctx.save()
     ctx.beginPath()
     ctx.ellipse(s.x, s.y, r, ry, 0, 0, TAU)
@@ -2285,6 +2367,37 @@ export class Renderer {
       ctx.closePath()
       ctx.fillStyle = ready ? hexA('#ffffff', 0.85 * m) : hexA('#ffffff', 0.35 * m)
       ctx.fill()
+    }
+    ctx.restore()
+  }
+
+  /** Hanging off the edge: three pulsing chevrons on the floor point the way home. */
+  private homeArrow(b: Body, project: Project): void {
+    const ctx = this.ctx
+    const dpr = this.dpr
+    const hx = b.safetyX
+    const hy = b.safetyY
+    if (hx * hx + hy * hy < 0.25) return
+    const held = b.input.x * hx + b.input.y * hy > 0.2
+    const col = held ? '#3ee6a0' : '#ffc14d'
+    ctx.save()
+    ctx.globalCompositeOperation = 'lighter'
+    for (let i = 0; i < 3; i++) {
+      const phase = (this.clock * 3 + i / 3) % 1
+      const d = b.radius + 18 + i * 22
+      const a = 0.35 + 0.65 * Math.sin(phase * Math.PI)
+      const tip = project(b.x + hx * (d + 12), b.y + hy * (d + 12))
+      const l = project(b.x + hx * d - hy * 13, b.y + hy * d + hx * 13)
+      const rr = project(b.x + hx * d + hy * 13, b.y + hy * d - hx * 13)
+      ctx.beginPath()
+      ctx.moveTo(l.x, l.y)
+      ctx.lineTo(tip.x, tip.y)
+      ctx.lineTo(rr.x, rr.y)
+      ctx.strokeStyle = hexA(col, a)
+      ctx.lineWidth = 5 * dpr
+      ctx.lineCap = 'round'
+      ctx.lineJoin = 'round'
+      ctx.stroke()
     }
     ctx.restore()
   }
@@ -2357,6 +2470,12 @@ export class Renderer {
       ctx.scale(1 + l, 1 - l)
     }
     if (fx.drop > 0 && !prefs.reducedMotion) ctx.scale(0.85, 1.2)
+    const teetering = b.teeter > 0 && b.edgeDist < 0 && !b.falling && !b.decoy
+    if (!prefs.reducedMotion) {
+      // A launched ball tumbles; one hanging off the edge wobbles to keep its balance.
+      if (b.stun > 0) ctx.rotate((this.clock * 16 + fx.seed * 7) * (b.vx >= 0 ? 1 : -1))
+      else if (teetering) ctx.rotate(Math.sin(this.clock * 24 + fx.seed * 5) * 0.28)
+    }
     paintBall(ctx, 0, 0, r, {
       color: b.color,
       skin: b.skin,
@@ -2376,6 +2495,84 @@ export class Renderer {
     ctx.restore()
 
     if (!b.decoy && !b.falling) this.auras(b, r)
+    if (b.stun > 0 && !b.decoy) this.dizzyStars(r, b.stun)
+    if (teetering) this.alarm(r)
+    ctx.restore()
+  }
+
+  /** Little stars circling the head of a stunned ball. */
+  private dizzyStars(r: number, stun: number): void {
+    const ctx = this.ctx
+    const dpr = this.dpr
+    ctx.save()
+    ctx.globalAlpha = clamp(stun * 6, 0, 1)
+    for (let i = 0; i < 3; i++) {
+      const a = this.clock * 9 + (i * TAU) / 3
+      const x = Math.cos(a) * r * 0.95
+      const y = -r * 1.15 + Math.sin(a) * r * 0.28
+      const sz = (4 + (Math.sin(a) + 1) * 1.6) * dpr
+      ctx.fillStyle = i === 0 ? '#ffe066' : '#ffffff'
+      ctx.beginPath()
+      for (let k = 0; k < 10; k++) {
+        const q = (k / 10) * TAU - Math.PI / 2
+        const rr = k % 2 ? sz * 0.42 : sz
+        ctx.lineTo(x + Math.cos(q) * rr, y + Math.sin(q) * rr)
+      }
+      ctx.closePath()
+      ctx.fill()
+    }
+    ctx.restore()
+  }
+
+  /** A bobbing "!" over a ball hanging off the edge. */
+  private alarm(r: number): void {
+    const ctx = this.ctx
+    const dpr = this.dpr
+    // Off to the upper side, clear of the name tag above the ball.
+    const x = r * 0.95 + 6 * dpr
+    const y = -r * 0.9 + Math.sin(this.clock * 18) * 2 * dpr
+    ctx.save()
+    ctx.translate(x, 0)
+    ctx.beginPath()
+    ctx.arc(0, y, 10 * dpr, 0, TAU)
+    ctx.fillStyle = '#ffc14d'
+    ctx.fill()
+    ctx.lineWidth = 2 * dpr
+    ctx.strokeStyle = 'rgba(8,10,24,0.9)'
+    ctx.stroke()
+    ctx.fillStyle = '#1d1200'
+    ctx.font = `${15 * dpr}px ${DISPLAY_FONT}`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText('!', 0, y + 1 * dpr)
+    ctx.restore()
+  }
+
+  /** A hot white streak behind a launched ball, so a big send reads at a glance. */
+  private launchStreak(b: Body, project: Project): void {
+    const fx = this.balls.get(b.id)
+    if (!fx || fx.launch <= 0.02) return
+    const speed = Math.hypot(b.vx, b.vy)
+    if (speed < 120) return
+    const ctx = this.ctx
+    const z = this.zOf(b) + b.radius
+    const len = Math.min(260, speed * 0.32) * clamp(fx.launch * 2, 0, 1)
+    const head = project(b.x, b.y, z)
+    const tail = project(b.x - Math.cos(fx.launchAng) * len, b.y - Math.sin(fx.launchAng) * len, z)
+    const r = b.radius * this.Z
+    ctx.save()
+    ctx.globalCompositeOperation = 'lighter'
+    const g = ctx.createLinearGradient(head.x, head.y, tail.x, tail.y)
+    g.addColorStop(0, hexA('#ffffff', 0.85 * clamp(fx.launch * 2, 0, 1)))
+    g.addColorStop(0.35, hexA(b.color, 0.55 * clamp(fx.launch * 2, 0, 1)))
+    g.addColorStop(1, hexA(b.color, 0))
+    ctx.strokeStyle = g
+    ctx.lineCap = 'round'
+    ctx.lineWidth = r * 1.7
+    ctx.beginPath()
+    ctx.moveTo(head.x, head.y)
+    ctx.lineTo(tail.x, tail.y)
+    ctx.stroke()
     ctx.restore()
   }
 
@@ -2466,9 +2663,13 @@ export class Renderer {
     return b.heat >= 1 ? `${Math.floor(b.heat)}%` : ''
   }
 
-  private labelWidth(b: Body): number {
+  private labelWidth(b: Body, compact = false): number {
     const ctx = this.ctx
     const dpr = this.dpr * this.labelScale
+    if (compact) {
+      ctx.font = `${16 * dpr}px ${DISPLAY_FONT}`
+      return ctx.measureText(this.heatText(b)).width + 18 * dpr
+    }
     ctx.font = `600 ${12 * dpr}px ${UI_FONT}`
     let w = ctx.measureText(b.name).width + 16 * dpr
     const heat = this.heatText(b)
@@ -2479,11 +2680,35 @@ export class Renderer {
     return w
   }
 
-  private label(b: Body, x: number, y: number, local: boolean, team = ''): void {
+  private label(b: Body, x: number, y: number, local: boolean, team = '', compact = false): void {
     const ctx = this.ctx
     const dpr = this.dpr * this.labelScale
     const ty = y
     ctx.save()
+    if (compact) {
+      // Crowded: just a colour dot and the heat, so you can still read who is launchable.
+      const heat = this.heatText(b)
+      ctx.globalAlpha = b.falling ? 0.5 : 0.95
+      ctx.font = `${16 * dpr}px ${DISPLAY_FONT}`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      const tw = ctx.measureText(heat).width
+      const dx = x - tw / 2 - 2 * dpr
+      ctx.beginPath()
+      ctx.arc(dx - 3 * dpr, ty, 4 * dpr, 0, TAU)
+      ctx.fillStyle = team || b.color
+      ctx.fill()
+      ctx.lineWidth = 1.5 * dpr
+      ctx.strokeStyle = 'rgba(8,10,24,0.9)'
+      ctx.stroke()
+      ctx.lineJoin = 'round'
+      ctx.lineWidth = 4 * dpr
+      ctx.strokeText(heat, x + 5 * dpr, ty + 1 * dpr)
+      ctx.fillStyle = heatColor(b.heat)
+      ctx.fillText(heat, x + 5 * dpr, ty + 1 * dpr)
+      ctx.restore()
+      return
+    }
     ctx.font = `600 ${12 * dpr}px ${UI_FONT}`
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
@@ -2773,7 +2998,8 @@ export class Renderer {
       live.y = y
       return
     }
-    this.add({ kind: 'text', x, y, z: 60, vx: (Math.random() - 0.5) * 40, vz: 90, size, color, life: 0.9, drag: 3, rot: (Math.random() - 0.5) * 0.25, text, owner })
+    // Numbers float up from above the name tags so they never sit on top of them.
+    this.add({ kind: 'text', x, y, z: 96, vx: (Math.random() - 0.5) * 40, vz: 110, size, color, life: 0.8, drag: 3, rot: (Math.random() - 0.5) * 0.25, text, owner })
   }
 
   private bolts(x: number, y: number, ang: number, k: number): void {
@@ -3032,6 +3258,65 @@ export class Renderer {
           ctx.moveTo(a.x, a.y)
           ctx.lineTo(b.x, b.y)
           ctx.stroke()
+        }
+      } else if (p.kind === 'burst') {
+        // Anime speed burst: sharp white spikes radiating from a heavy launch.
+        ctx.globalCompositeOperation = 'lighter'
+        const s = project(p.x, p.y, p.z)
+        const R = p.size * Z * (0.5 + easeOutCubic(u) * 0.8)
+        ctx.fillStyle = hexA('#ffffff', 0.9 * t)
+        for (let i = 0; i < 14; i++) {
+          const a = p.rot + Math.PI + (hashN(i + p.seed * 50) - 0.5) * 2.6
+          const len = R * (0.6 + hashN(i * 3 + p.seed * 70) * 0.7)
+          const w = (2 + hashN(i * 7) * 4) * dpr
+          const r0 = R * 0.25
+          ctx.beginPath()
+          ctx.moveTo(s.x + Math.cos(a) * r0 - Math.sin(a) * w, s.y + (Math.sin(a) * r0 + Math.cos(a) * w) * TILT)
+          ctx.lineTo(s.x + Math.cos(a) * (r0 + len), s.y + Math.sin(a) * (r0 + len) * TILT)
+          ctx.lineTo(s.x + Math.cos(a) * r0 + Math.sin(a) * w, s.y + (Math.sin(a) * r0 - Math.cos(a) * w) * TILT)
+          ctx.closePath()
+          ctx.fill()
+        }
+      } else if (p.kind === 'edgeflare') {
+        ctx.globalCompositeOperation = 'lighter'
+        const W = this.canvas.width
+        const H = this.canvas.height
+        const s = project(p.x, p.y, p.z)
+        let dx = Math.cos(p.rot)
+        let dy = Math.sin(p.rot) * TILT
+        const dl = Math.hypot(dx, dy) || 1
+        dx /= dl
+        dy /= dl
+        // March from the knockout point along its flight until the screen border.
+        let k = Infinity
+        if (dx > 1e-3) k = Math.min(k, (W - s.x) / dx)
+        if (dx < -1e-3) k = Math.min(k, -s.x / dx)
+        if (dy > 1e-3) k = Math.min(k, (H - s.y) / dy)
+        if (dy < -1e-3) k = Math.min(k, -s.y / dy)
+        if (!Number.isFinite(k)) k = 0
+        const ex = clamp(s.x + dx * Math.max(0, k), 0, W)
+        const ey = clamp(s.y + dy * Math.max(0, k), 0, H)
+        const pop = easeOutCubic(clamp(u * 3, 0, 1))
+        const R = Math.min(W, H) * 0.32 * p.size * (0.4 + pop * 0.8)
+        const g = ctx.createRadialGradient(ex, ey, 0, ex, ey, R)
+        g.addColorStop(0, hexA('#ffffff', 0.95 * t))
+        g.addColorStop(0.2, hexA(p.color, 0.8 * t))
+        g.addColorStop(1, hexA(p.color, 0))
+        ctx.fillStyle = g
+        ctx.fillRect(ex - R, ey - R, R * 2, R * 2)
+        // Spikes fanning back into the screen.
+        ctx.fillStyle = hexA('#ffffff', 0.75 * t)
+        const back = Math.atan2(-dy, -dx)
+        for (let i = 0; i < 9; i++) {
+          const a = back + (hashN(i + p.seed * 40) - 0.5) * 2.2
+          const len = R * (0.9 + hashN(i * 5 + p.seed * 9) * 0.9)
+          const wd = (3 + hashN(i * 11) * 6) * dpr
+          ctx.beginPath()
+          ctx.moveTo(ex - Math.sin(a) * wd, ey + Math.cos(a) * wd)
+          ctx.lineTo(ex + Math.cos(a) * len, ey + Math.sin(a) * len)
+          ctx.lineTo(ex + Math.sin(a) * wd, ey - Math.cos(a) * wd)
+          ctx.closePath()
+          ctx.fill()
         }
       } else if (p.kind === 'faller' && p.look) {
         const s = project(p.x, p.y, p.z)

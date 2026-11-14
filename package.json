@@ -8,7 +8,10 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "balance": "vite-node scripts/balance.ts",
+    "census": "vite-node scripts/census.ts",
+    "tutorial-timing": "vite-node scripts/tutorial.ts"
   },
   "devDependencies": {
     "typescript": "^5.8.3",

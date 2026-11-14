@@ -1,5 +1,5 @@
 import { hypot } from '../core/math'
-import { capSpeed, heatMul } from './impact'
+import { capSpeed, heatMul, stunFor } from './impact'
 import type { Body } from './body'
 import { createBody } from './body'
 
@@ -34,7 +34,7 @@ export function castAbility(body: Body, ctx: CastContext): number {
       hits = radial(body, ctx, 172, 380, 1)
       break
     case 'magnet':
-      body.magnetTime = 0.75
+      body.magnetTime = 0.9
       hits = countNear(body, ctx, 210)
       break
     case 'phase':
@@ -44,7 +44,7 @@ export function castAbility(body: Body, ctx: CastContext): number {
       body.overdriveTime = 1.45
       break
     case 'anchor':
-      body.anchorTime = 1.25
+      body.anchorTime = 1.05
       body.vx *= 0.15
       body.vy *= 0.15
       break
@@ -65,11 +65,11 @@ export function castAbility(body: Body, ctx: CastContext): number {
       break
     }
     case 'gravity-well':
-      ctx.addWell({ x: body.x, y: body.y, r: 150, ttl: 1.7, ownerId: body.id, acc: 640 })
+      ctx.addWell({ x: body.x, y: body.y, r: 165, ttl: 2, ownerId: body.id, acc: 880 })
       hits = countNear(body, ctx, 150)
       break
     case 'mirror':
-      body.mirrorTime = 2.35
+      body.mirrorTime = 1.7
       break
     case 'split':
       ctx.addDecoy(makeDecoy(body, steer))
@@ -149,6 +149,7 @@ function radial(body: Body, ctx: CastContext, radius: number, power: number, dir
     o.lastAttacker = body.id
     o.lastHitTime = ctx.time
     o.hitFlash = 1
+    stunBody(o, stunFor(kick) * 0.75)
     hits++
   }
   return hits
@@ -173,6 +174,7 @@ function cone(body: Body, ctx: CastContext, steer: { x: number; y: number }, rad
     o.lastAttacker = body.id
     o.lastHitTime = ctx.time
     o.hitFlash = 1
+    stunBody(o, stunFor(kick) * 0.75)
     hits++
   }
   return hits
@@ -245,6 +247,13 @@ function makeDecoy(owner: Body, steer: { x: number; y: number }): Body {
   d.abilityCd = 99
   d.dashCd = 99
   return d
+}
+
+/** Applies launch stun without shortening one already running. */
+export function stunBody(b: Body, seconds: number): void {
+  if (seconds <= b.stun || b.decoy) return
+  b.stun = seconds
+  b.stunMax = seconds
 }
 
 export function decayWells(wells: Well[], dt: number): Well[] {
